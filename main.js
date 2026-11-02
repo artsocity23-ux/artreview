@@ -40,8 +40,16 @@ function log(...parts) {
   }
 }
 
-process.on('uncaughtException', err => log('ERROR', err.stack || err));
-process.on('unhandledRejection', err => log('ERROR', err?.stack || err));
+// A self-test run must fail with exit code 1, never hang or leave a dialog over the user's work.
+function crashed(err) {
+  log('ERROR', err?.stack || err);
+  if (SELFTEST) {
+    console.error(err);
+    app.exit(1);
+  }
+}
+process.on('uncaughtException', crashed);
+process.on('unhandledRejection', crashed);
 
 function readJSON(file) {
   try {
@@ -406,10 +414,10 @@ if (!SELFTEST && !app.requestSingleInstanceLock()) {
     log(`start ${app.getVersion()}`);
     if (SELFTEST) {
       fs.mkdirSync(OUT, { recursive: true });
-      require('./selftest')({ win, out: OUT }).catch(err => {
-        console.error(err);
-        app.exit(1);
-      });
+      // Inside a promise, so a syntax error in selftest.js also ends the run with exit code 1.
+      Promise.resolve()
+        .then(() => require('./selftest')({ win, out: OUT }))
+        .catch(crashed);
     }
   });
 }
