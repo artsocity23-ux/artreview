@@ -1,6 +1,6 @@
 'use strict';
 
-const api = window.af;
+const api = window.ar;
 
 function el(tag, props = {}, ...children) {
   const node = Object.assign(document.createElement(tag), props);

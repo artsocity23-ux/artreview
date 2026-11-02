@@ -1,27 +1,26 @@
 {
-  "name": "artframes",
-  "productName": "ArtFrames",
-  "version": "0.2.0",
+  "name": "artreview",
+  "productName": "ArtReview",
+  "version": "0.1.0",
   "private": true,
-  "description": "Light frame-by-frame animation: onion skin, round and flat brushes, drawing over a video or picture, GIF/MP4/PNG export.",
+  "description": "Art-direction notes on a video shot: numbered pins that follow objects, one button to copy the MP4 with the notes burned in.",
   "author": {
     "name": "artsocity23-ux",
     "email": "263427273+artsocity23-ux@users.noreply.github.com"
   },
-  "homepage": "https://github.com/artsocity23-ux/artframes",
-  "repository": "github:artsocity23-ux/artframes",
+  "homepage": "https://github.com/artsocity23-ux/artreview",
+  "repository": "github:artsocity23-ux/artreview",
   "license": "MIT",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "selftest": "electron . --selftest selftest-out",
+    "test": "node test/tracker.test.mjs",
+    "test:clipboard": "node test/clipboard.test.js",
     "icon": "node make-icon.js",
-    "dist": "electron-builder --publish never",
-    "bench": "electron . --bench bench-out",
-    "demo": "electron . --demo demo-out"
+    "dist": "electron-builder --publish never"
   },
   "dependencies": {
-    "gifenc": "^1.0.3",
     "mediabunny": "^1.65.0",
     "qrcode-generator": "^2.0.4"
   },
@@ -30,8 +29,8 @@
     "electron-builder": "^26.18.0"
   },
   "build": {
-    "appId": "io.github.artsocity23ux.artframes",
-    "productName": "ArtFrames",
+    "appId": "io.github.artsocity23ux.artreview",
+    "productName": "ArtReview",
     "copyright": "© 2026 artsocity23-ux · MIT",
     "artifactName": "${productName}-${version}-${arch}.${ext}",
     "directories": {
@@ -41,9 +40,8 @@
     "files": [
       "main.js",
       "preload.js",
+      "clipboard.js",
       "selftest.js",
-      "bench.js",
-      "demo.js",
       "index.html",
       "app.css",
       "src/**",
@@ -51,20 +49,19 @@
       "donate.js",
       "donate.json",
       "icon.png",
+      "!test/**",
       "!**/*.map",
       "!**/*.d.ts",
       "!node_modules/mediabunny/src/**",
       "!node_modules/mediabunny/dist/modules/**",
       "!node_modules/mediabunny/dist/bundles/*.cjs",
-      "!node_modules/mediabunny/dist/bundles/mediabunny.mjs",
-      "!node_modules/gifenc/dist/gifenc.js",
-      "!node_modules/gifenc/src/**"
+      "!node_modules/mediabunny/dist/bundles/mediabunny.mjs"
     ],
     "fileAssociations": [
       {
-        "ext": "artframes",
-        "name": "ArtFrames project",
-        "description": "Проєкт ArtFrames",
+        "ext": "artreview",
+        "name": "ArtReview notes",
+        "description": "Нотатки ArtReview",
         "role": "Editor"
       }
     ],
@@ -87,7 +84,7 @@
       "oneClick": true,
       "perMachine": false,
       "runAfterFinish": true,
-      "shortcutName": "ArtFrames",
+      "shortcutName": "ArtReview",
       "artifactName": "${productName}-Setup-${version}.${ext}"
     },
     "mac": {
@@ -100,7 +97,7 @@
           ]
         }
       ],
-      "category": "public.app-category.graphics-design",
+      "category": "public.app-category.video",
       "icon": "build/icon.png",
       "identity": "-",
       "hardenedRuntime": false
@@ -110,9 +107,9 @@
         "AppImage",
         "deb"
       ],
-      "category": "Graphics",
+      "category": "AudioVideo",
       "icon": "build/icon.png",
-      "synopsis": "Frame-by-frame animation with onion skin and video reference",
+      "synopsis": "Art-direction notes on video shots, copied to the clipboard as an MP4",
       "maintainer": "artsocity23-ux <263427273+artsocity23-ux@users.noreply.github.com>"
     }
   }

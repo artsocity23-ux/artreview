@@ -2,40 +2,42 @@ const { contextBridge, ipcRenderer, webUtils } = require('electron');
 
 const invoke = (channel, ...args) => ipcRenderer.invoke(channel, ...args);
 
-contextBridge.exposeInMainWorld('af', {
-  env: ipcRenderer.sendSync('af:env'),
+// Everything returns a Promise except env, pathForFile and the fire-and-forget calls (dragOut, setTitle, log, ...).
+contextBridge.exposeInMainWorld('ar', {
+  env: ipcRenderer.sendSync('ar:env'),
   // dialogs and files
-  openDialog: kind => invoke('af:open-dialog', kind),
-  saveDialog: (kind, name) => invoke('af:save-dialog', kind, name),
-  folderDialog: () => invoke('af:folder-dialog'),
-  read: file => invoke('af:read', file),
-  write: (file, data) => invoke('af:write', file, data),
-  writeIn: (dir, name, data) => invoke('af:write-in', dir, name, data),
-  stat: file => invoke('af:stat', file),
-  fileURL: file => invoke('af:file-url', file),
-  reveal: file => invoke('af:reveal', file),
+  openDialog: kind => invoke('ar:open-dialog', kind), // 'video' | 'review' -> path | null
+  saveDialog: (kind, name) => invoke('ar:save-dialog', kind, name), // 'review' -> path | null
+  folderDialog: () => invoke('ar:folder-dialog'),
+  read: file => invoke('ar:read', file), // -> Uint8Array
+  write: (file, bytes) => invoke('ar:write', file, bytes), // bytes or a string; creates the folder
+  stat: file => invoke('ar:stat', file), // -> { size, mtime } | null
+  fileURL: file => invoke('ar:file-url', file),
+  reveal: file => invoke('ar:reveal', file),
   pathForFile: file => webUtils.getPathForFile(file),
-  range: (file, start, end) => invoke('af:range', file, start, end),
-  rangeClose: file => invoke('af:range-close', file),
-  // projects
-  saveProject: (file, payload) => invoke('af:project-save', file, payload),
-  loadProject: file => invoke('af:project-load', file),
-  autosave: payload => invoke('af:autosave', payload),
-  autosaveInfo: () => invoke('af:autosave-info'),
-  autosaveLoad: () => invoke('af:autosave-load'),
-  autosaveClear: () => invoke('af:autosave-clear'),
-  pendingFile: () => invoke('af:pending-file'),
-  onOpenFile: cb => ipcRenderer.on('af:open-file', (e, file) => cb(file)),
-  onSaveAndClose: cb => ipcRenderer.on('af:save-and-close', () => cb()),
+  range: (file, start, end) => invoke('ar:range', file, start, end),
+  rangeClose: file => invoke('ar:range-close', file),
+  // settings and autosave
+  settings: () => invoke('ar:settings'),
+  setSettings: patch => invoke('ar:set-settings', patch), // -> the full settings after the patch
+  defaultOutDir: () => invoke('ar:default-out-dir'),
+  reviewAutosave: (key, json) => invoke('ar:review-autosave', key, json), // key /^[0-9a-f]{8,64}$/, json = JSON text
+  reviewAutoload: key => invoke('ar:review-autoload', key), // -> the saved JSON text | null
+  // clipboard and sharing
+  copyVideo: (file, text) => invoke('ar:copy-video', file, text ?? null), // -> { ok, withText }
+  copyText: text => invoke('ar:copy-text', text),
+  dragOut: file => ipcRenderer.send('ar:drag-out', file), // call from a dragstart handler (after preventDefault)
+  // files from the OS
+  pendingFile: () => invoke('ar:pending-file'),
+  onOpenFile: cb => ipcRenderer.on('ar:open-file', (e, file) => cb(file)),
   // window
-  setState: state => ipcRenderer.send('af:state', state),
-  closeNow: () => ipcRenderer.send('af:close-now'),
-  log: (...parts) => ipcRenderer.send('af:log', ...parts),
+  setTitle: title => ipcRenderer.send('ar:set-title', title),
+  log: (...parts) => ipcRenderer.send('ar:log', ...parts),
   // donate
-  donateAvailable: () => invoke('af:donate-available'),
-  openDonate: () => ipcRenderer.send('af:donate-open-window'),
-  donate: () => invoke('af:donate'),
-  donateCopy: i => invoke('af:donate-copy', i),
-  donateOpen: i => ipcRenderer.send('af:donate-open', i),
-  donateReady: height => ipcRenderer.send('af:donate-ready', height),
+  donateAvailable: () => invoke('ar:donate-available'),
+  openDonate: () => ipcRenderer.send('ar:donate-open-window'),
+  donate: () => invoke('ar:donate'),
+  donateCopy: i => invoke('ar:donate-copy', i),
+  donateOpen: i => ipcRenderer.send('ar:donate-open', i),
+  donateReady: height => ipcRenderer.send('ar:donate-ready', height),
 });

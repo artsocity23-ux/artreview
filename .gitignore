@@ -1,7 +1,8 @@
 node_modules/
 selftest-out/
-artframes.log*
-autosave.artframes*
 dist/
-bench-out/
-demo-out/
+test-tmp/
+# a source run keeps these beside the code
+/artreview.log*
+/settings.json*
+/reviews/

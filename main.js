@@ -1,21 +1,24 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme, screen, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme, nativeImage, screen, clipboard } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { pathToFileURL } = require('url');
 const qrcode = require('qrcode-generator');
+const { copyVideo } = require('./clipboard');
 
 const ROOT = __dirname;
-const BENCH = process.argv.includes('--bench');
-const DEMO = process.argv.includes('--demo');
-// The self-test, the benchmark and the README demo recording drive the app themselves: default prefs, no dialogs.
-const SELFTEST = process.argv.includes('--selftest') || BENCH || DEMO;
-const IS_MAC = process.platform === 'darwin';
-// An installed build keeps the log and the autosave in the per-user app data folder, a source checkout beside the code.
+// The self-test drives the app itself: default settings, no dialogs, nothing written outside its folder.
+const SELFTEST = process.argv.includes('--selftest');
+// An installed build keeps the log, settings and autosaves in the per-user app data folder, a source checkout beside the code.
 const DATA = app.isPackaged ? app.getPath('userData') : ROOT;
-const LOG = path.join(DATA, 'artframes.log');
-const testArg = process.argv.indexOf(BENCH ? '--bench' : DEMO ? '--demo' : '--selftest');
-const OUT = SELFTEST ? path.resolve(process.argv[testArg + 1] || 'selftest-out') : null;
-const AUTOSAVE = SELFTEST ? path.join(OUT, 'autosave.artframes') : path.join(DATA, 'autosave.artframes');
+const LOG = path.join(DATA, 'artreview.log');
+const OUT = SELFTEST ? path.resolve(process.argv[process.argv.indexOf('--selftest') + 1] || 'selftest-out') : null;
+const SETTINGS_FILE = path.join(DATA, 'settings.json');
+const REVIEWS = SELFTEST ? path.join(OUT, 'reviews') : path.join(DATA, 'reviews');
+
+const VIDEO_EXT = ['mp4', 'mov', 'm4v', 'webm', 'mkv'];
+const OPENABLE = new RegExp(`\\.(artreview|${VIDEO_EXT.join('|')})$`, 'i');
+
+const DEFAULT_SETTINGS = { outDir: null, maxSize: 1920, endCard: true, hud: true, audio: true, startFrame: 1, copyTextWithVideo: true };
 
 // Donation options live in donate.json; entries left empty are not shown.
 const donate = readJSON(path.join(ROOT, 'donate.json'));
@@ -23,9 +26,8 @@ const donateCrypto = (donate.crypto || []).filter(c => c.address);
 const donateLinks = (donate.links || []).filter(l => /^https:\/\//.test(l.url || ''));
 
 let win = null;
-let dirty = false;
-let closing = false;
-let pendingFile = fileFromArgs(process.argv);
+let pendingFile = SELFTEST ? null : fileFromArgs(process.argv);
+let settings = SELFTEST ? { ...DEFAULT_SETTINGS } : cleanSettings(readJSON(SETTINGS_FILE));
 
 function log(...parts) {
   if (SELFTEST) return;
@@ -50,7 +52,41 @@ function readJSON(file) {
 }
 
 function fileFromArgs(argv) {
-  return argv.slice(1).find(a => /\.artframes$/i.test(a) && fs.existsSync(a)) || null;
+  return argv.slice(1).find(a => OPENABLE.test(a) && fs.existsSync(a)) || null;
+}
+
+function writeAtomic(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, file);
+}
+
+// ---------- settings ----------
+
+// Only known keys of the right type survive, so a hand-edited or older settings.json cannot break the renderer.
+// maxSize 0 means "original size".
+function cleanSettings(raw) {
+  const s = { ...DEFAULT_SETTINGS };
+  for (const [k, v] of Object.entries(raw || {})) {
+    if (!(k in DEFAULT_SETTINGS)) continue;
+    if (k === 'outDir') s.outDir = typeof v === 'string' && v ? v : null;
+    else if (k === 'maxSize') s.maxSize = v === null || v === 0 ? 0 : Number.isFinite(v) && v > 0 ? Math.round(v) : s.maxSize;
+    else if (k === 'startFrame') s.startFrame = Number.isInteger(v) && v >= 0 ? v : s.startFrame;
+    else if (typeof v === 'boolean') s[k] = v;
+  }
+  return s;
+}
+
+function defaultOutDir() {
+  if (SELFTEST) return path.join(OUT, 'ArtReview');
+  let videos;
+  try {
+    videos = app.getPath('videos');
+  } catch {
+    videos = path.join(app.getPath('home'), 'Videos'); // some Linux desktops have no XDG videos folder
+  }
+  return path.join(videos, 'ArtReview');
 }
 
 // ---------- window ----------
@@ -58,12 +94,12 @@ function fileFromArgs(argv) {
 function createWindow() {
   const { workArea } = screen.getPrimaryDisplay();
   win = new BrowserWindow({
-    width: SELFTEST ? 1600 : Math.min(1680, workArea.width),
-    height: SELFTEST ? 1000 : Math.min(1040, workArea.height),
-    minWidth: 1100,
-    minHeight: 620,
+    width: SELFTEST ? 1600 : Math.min(1600, workArea.width),
+    height: SELFTEST ? 1000 : Math.min(1000, workArea.height),
+    minWidth: 960,
+    minHeight: 600,
     show: false,
-    title: 'ArtFrames',
+    title: 'ArtReview',
     backgroundColor: '#15171c',
     icon: path.join(ROOT, 'icon.png'),
     autoHideMenuBar: true,
@@ -82,25 +118,7 @@ function createWindow() {
     if (e.level === 'error') log('renderer:', e.message);
   });
   win.webContents.on('render-process-gone', (e, d) => log('renderer gone:', d.reason));
-  win.on('close', e => {
-    if (closing || !dirty || SELFTEST) return;
-    e.preventDefault();
-    const choice = dialog.showMessageBoxSync(win, {
-      type: 'question',
-      buttons: ['Зберегти', 'Не зберігати', 'Скасувати'],
-      defaultId: 0,
-      cancelId: 2,
-      title: 'ArtFrames',
-      message: 'Зберегти зміни в проєкті?',
-      detail: 'Інакше намальоване після останнього збереження пропаде.',
-    });
-    if (choice === 0) win.webContents.send('af:save-and-close');
-    if (choice === 1) {
-      fs.rmSync(AUTOSAVE, { force: true });
-      closing = true;
-      win.close();
-    }
-  });
+  // No save prompt on close: the renderer autosaves the notes of every video as it goes.
   win.on('closed', () => {
     win = null;
     for (const fd of fds.values()) fs.closeSync(fd);
@@ -111,24 +129,17 @@ function createWindow() {
 // ---------- file access ----------
 
 const FILTERS = {
-  project: [{ name: 'Проєкт ArtFrames', extensions: ['artframes'] }],
-  reference: [
-    { name: 'Картинка або відео', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'mp4', 'mov', 'm4v', 'webm', 'mkv'] },
-    { name: 'Відео', extensions: ['mp4', 'mov', 'm4v', 'webm', 'mkv'] },
-    { name: 'Картинка', extensions: ['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif'] },
-  ],
-  gif: [{ name: 'GIF', extensions: ['gif'] }],
-  mp4: [{ name: 'Відео MP4', extensions: ['mp4'] }],
-  webm: [{ name: 'Відео WebM', extensions: ['webm'] }],
+  video: [{ name: 'Відео', extensions: VIDEO_EXT }],
+  review: [{ name: 'Нотатки ArtReview', extensions: ['artreview'] }],
 };
 
 let lastDir = app.getPath('documents');
 
-ipcMain.handle('af:open-dialog', async (e, kind) => {
+ipcMain.handle('ar:open-dialog', async (e, kind) => {
   const { canceled, filePaths } = await dialog.showOpenDialog(win, {
-    title: kind === 'project' ? 'Відкрити проєкт' : 'Референс: картинка або відео',
+    title: kind === 'review' ? 'Відкрити нотатки' : 'Відкрити відео',
     defaultPath: lastDir,
-    filters: FILTERS[kind],
+    filters: FILTERS[kind] || FILTERS.video,
     properties: ['openFile'],
   });
   if (canceled || !filePaths[0]) return null;
@@ -136,47 +147,40 @@ ipcMain.handle('af:open-dialog', async (e, kind) => {
   return filePaths[0];
 });
 
-ipcMain.handle('af:save-dialog', async (e, kind, name) => {
+ipcMain.handle('ar:save-dialog', async (e, kind, name) => {
   const { canceled, filePath } = await dialog.showSaveDialog(win, {
-    title: kind === 'project' ? 'Зберегти проєкт' : 'Експорт',
-    defaultPath: path.join(lastDir, name),
-    filters: FILTERS[kind],
+    title: 'Зберегти нотатки',
+    defaultPath: path.join(lastDir, name || 'notes.artreview'),
+    filters: FILTERS[kind] || FILTERS.review,
   });
   if (canceled || !filePath) return null;
   lastDir = path.dirname(filePath);
   return filePath;
 });
 
-ipcMain.handle('af:folder-dialog', async () => {
+ipcMain.handle('ar:folder-dialog', async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog(win, {
-    title: 'Папка для PNG-кадрів',
-    defaultPath: lastDir,
+    title: 'Папка для відео з нотатками',
+    defaultPath: settings.outDir || defaultOutDir(),
     properties: ['openDirectory', 'createDirectory'],
   });
   if (canceled || !filePaths[0]) return null;
-  lastDir = filePaths[0];
   return filePaths[0];
 });
 
-ipcMain.handle('af:read', (e, file) => fs.promises.readFile(file));
-ipcMain.handle('af:write', async (e, file, data) => {
+ipcMain.handle('ar:read', (e, file) => fs.promises.readFile(file));
+ipcMain.handle('ar:write', async (e, file, data) => {
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
   await fs.promises.writeFile(file, data);
   return file;
 });
-ipcMain.handle('af:write-in', async (e, dir, name, data) => {
-  await fs.promises.mkdir(dir, { recursive: true });
-  const file = path.join(dir, name);
-  await fs.promises.writeFile(file, data);
-  return file;
-});
-ipcMain.handle('af:stat', (e, file) => fs.promises.stat(file).then(s => ({ size: s.size, mtime: s.mtimeMs }), () => null));
-ipcMain.handle('af:file-url', (e, file) => pathToFileURL(file).href);
-ipcMain.handle('af:reveal', (e, file) => shell.showItemInFolder(file));
+ipcMain.handle('ar:stat', (e, file) => fs.promises.stat(file).then(s => ({ size: s.size, mtime: s.mtimeMs }), () => null));
+ipcMain.handle('ar:file-url', (e, file) => pathToFileURL(file).href);
+ipcMain.handle('ar:reveal', (e, file) => shell.showItemInFolder(file));
 
 // Byte ranges for the video decoder, so a long video never has to sit in memory as a whole.
 const fds = new Map();
-ipcMain.handle('af:range', async (e, file, start, end) => {
+ipcMain.handle('ar:range', async (e, file, start, end) => {
   let fd = fds.get(file);
   if (fd === undefined) {
     fd = fs.openSync(file, 'r');
@@ -187,84 +191,85 @@ ipcMain.handle('af:range', async (e, file, start, end) => {
     fs.read(fd, buf, 0, buf.length, start, (err, bytesRead) => (err ? reject(err) : resolve({ bytesRead }))));
   return bytesRead === buf.length ? buf : buf.subarray(0, bytesRead);
 });
-ipcMain.handle('af:range-close', (e, file) => {
+ipcMain.handle('ar:range-close', (e, file) => {
   const fd = fds.get(file);
   if (fd !== undefined) fs.closeSync(fd);
   fds.delete(file);
 });
 
-// ---------- project files ----------
-// A project is one JSON file: settings plus every drawing as base64 PNG. Videos stay where they are (path only),
-// a reference picture is embedded so the project still opens on another computer. The own (drawn) reference is
-// one more PNG with its visibility and opacity; older files simply have none.
+// ---------- settings, autosave ----------
 
-function encodeProject({ meta, frames, refBytes, sketch }) {
-  const reference = meta.reference && { ...meta.reference, data: refBytes ? Buffer.from(refBytes).toString('base64') : null };
-  return JSON.stringify({
-    format: 'artframes',
-    version: 1,
-    ...meta,
-    reference,
-    sketch: sketch && { ...sketch, png: Buffer.from(sketch.png).toString('base64') },
-    frames: frames.map(f => ({ hold: f.hold, png: f.png ? Buffer.from(f.png).toString('base64') : null })),
-  });
+ipcMain.handle('ar:settings', () => ({ ...settings }));
+ipcMain.handle('ar:set-settings', (e, patch) => {
+  settings = cleanSettings({ ...settings, ...patch });
+  if (!SELFTEST) {
+    try {
+      writeAtomic(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+    } catch (err) {
+      log('settings not saved:', err.message);
+    }
+  }
+  return { ...settings };
+});
+ipcMain.handle('ar:default-out-dir', () => defaultOutDir());
+
+// The key comes from the renderer (a hash of the video path and size); the pattern keeps it a plain file name.
+function reviewFile(key) {
+  if (typeof key !== 'string' || !/^[0-9a-f]{8,64}$/.test(key)) throw new Error(`bad review key: ${key}`);
+  return path.join(REVIEWS, `${key}.artreview`);
 }
-
-function decodeProject(text) {
-  const data = JSON.parse(text);
-  if (data.format !== 'artframes') throw new Error('Це не проєкт ArtFrames');
-  const { frames, reference, sketch, ...meta } = data;
-  return {
-    meta,
-    reference: reference && { ...reference, data: reference.data ? Buffer.from(reference.data, 'base64') : null },
-    sketch: sketch?.png ? { ...sketch, png: Buffer.from(sketch.png, 'base64') } : null,
-    frames: frames.map(f => ({ hold: f.hold, png: f.png ? Buffer.from(f.png, 'base64') : null })),
-  };
-}
-
-async function writeAtomic(file, text) {
-  await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp`;
-  await fs.promises.writeFile(tmp, text);
-  await fs.promises.rename(tmp, file);
-}
-
-ipcMain.handle('af:project-save', async (e, file, payload) => {
-  await writeAtomic(file, encodeProject(payload));
-  fs.rmSync(AUTOSAVE, { force: true });
-  log(`saved ${file} (${payload.frames.length} frames)`);
-  return file;
+ipcMain.handle('ar:review-autosave', (e, key, json) => {
+  writeAtomic(reviewFile(key), typeof json === 'string' ? json : JSON.stringify(json));
+});
+ipcMain.handle('ar:review-autoload', (e, key) => {
+  try {
+    return fs.readFileSync(reviewFile(key), 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') log('autoload failed:', err.message);
+    return null;
+  }
 });
 
-ipcMain.handle('af:project-load', async (e, file) => {
-  const project = decodeProject(await fs.promises.readFile(file, 'utf8'));
-  lastDir = path.dirname(file);
-  log(`opened ${file} (${project.frames.length} frames)`);
-  return project;
+// ---------- clipboard, drag-out ----------
+
+ipcMain.handle('ar:copy-video', async (e, file, text) => {
+  const r = await copyVideo(file, text);
+  log(`copy video ${file}: ${r.ok ? (r.withText ? 'file + text' : 'file') : `failed (${r.error})`}`);
+  return { ok: r.ok, withText: r.withText };
+});
+ipcMain.handle('ar:copy-text', (e, text) => clipboard.writeText(String(text ?? '')));
+
+let dragIcon = null;
+ipcMain.on('ar:drag-out', (e, file) => {
+  if (!file || !fs.existsSync(file)) return;
+  // startDrag needs a non-empty icon (macOS throws without one).
+  dragIcon ||= nativeImage.createFromPath(path.join(ROOT, 'icon.png')).resize({ width: 48, height: 48 });
+  e.sender.startDrag({ file, icon: dragIcon });
 });
 
-ipcMain.handle('af:autosave', (e, payload) => writeAtomic(AUTOSAVE, encodeProject(payload)));
-ipcMain.handle('af:autosave-info', () => (fs.existsSync(AUTOSAVE) && !SELFTEST ? { mtime: fs.statSync(AUTOSAVE).mtimeMs } : null));
-ipcMain.handle('af:autosave-load', async () => decodeProject(await fs.promises.readFile(AUTOSAVE, 'utf8')));
-ipcMain.handle('af:autosave-clear', () => fs.rmSync(AUTOSAVE, { force: true }));
+// ---------- misc ----------
 
-ipcMain.on('af:env', e => {
+ipcMain.on('ar:env', e => {
   e.returnValue = { selftest: SELFTEST, version: app.getVersion(), platform: process.platform };
 });
-ipcMain.handle('af:pending-file', () => {
+ipcMain.handle('ar:pending-file', () => {
   const file = pendingFile;
   pendingFile = null;
   return file;
 });
-ipcMain.on('af:state', (e, state) => {
-  dirty = state.dirty;
-  win?.setTitle(state.title);
-});
-ipcMain.on('af:close-now', () => {
-  closing = true;
-  win?.close();
-});
-ipcMain.on('af:log', (e, ...parts) => log(...parts));
+ipcMain.on('ar:set-title', (e, title) => win?.setTitle(String(title || 'ArtReview')));
+ipcMain.on('ar:log', (e, ...parts) => log(...parts));
+
+function openFromOS(file) {
+  if (!file || !OPENABLE.test(file)) return;
+  if (!win) {
+    pendingFile = file;
+    return;
+  }
+  win.webContents.send('ar:open-file', file);
+  if (win.isMinimized()) win.restore();
+  win.focus();
+}
 
 // ---------- donate window ----------
 
@@ -280,7 +285,7 @@ function openDonate() {
     resizable: false,
     minimizable: false,
     maximizable: false,
-    title: 'Підтримати ArtFrames',
+    title: 'Підтримати ArtReview',
     backgroundColor: '#15171c',
     icon: path.join(ROOT, 'icon.png'),
     autoHideMenuBar: true,
@@ -299,15 +304,15 @@ function qrDataURL(text) {
   return qr.createDataURL(6, 24);
 }
 
-ipcMain.handle('af:donate-available', () => donateCrypto.length + donateLinks.length > 0);
-ipcMain.on('af:donate-open-window', () => openDonate());
-ipcMain.handle('af:donate', () => ({
+ipcMain.handle('ar:donate-available', () => donateCrypto.length + donateLinks.length > 0);
+ipcMain.on('ar:donate-open-window', () => openDonate());
+ipcMain.handle('ar:donate', () => ({
   crypto: donateCrypto.map(c => ({ name: c.name, network: c.network, address: c.address, qr: qrDataURL(c.address) })),
   links: donateLinks.map(l => l.name),
 }));
-ipcMain.handle('af:donate-copy', (e, i) => clipboard.writeText(donateCrypto[i]?.address || ''));
-ipcMain.on('af:donate-open', (e, i) => donateLinks[i] && shell.openExternal(donateLinks[i].url));
-ipcMain.on('af:donate-ready', (e, height) => {
+ipcMain.handle('ar:donate-copy', (e, i) => clipboard.writeText(donateCrypto[i]?.address || ''));
+ipcMain.on('ar:donate-open', (e, i) => donateLinks[i] && shell.openExternal(donateLinks[i].url));
+ipcMain.on('ar:donate-ready', (e, height) => {
   if (!donateWin || donateWin.isDestroyed() || e.sender !== donateWin.webContents) return;
   const { workArea } = screen.getDisplayMatching(donateWin.getBounds());
   donateWin.setContentSize(480, Math.min(Math.ceil(height), workArea.height - 40));
@@ -318,28 +323,35 @@ ipcMain.on('af:donate-ready', (e, height) => {
 // ---------- lifecycle ----------
 
 nativeTheme.themeSource = 'dark';
-if (BENCH) {
-  // Frames as fast as the renderer can make them, to see the real cost of drawing.
-  app.commandLine.appendSwitch('disable-gpu-vsync');
-  app.commandLine.appendSwitch('disable-frame-rate-limit');
+if (process.platform === 'win32') app.setAppUserModelId('io.github.artsocity23ux.artreview');
+
+// One window: a video double-clicked in Explorer while ArtReview runs opens in the running window.
+// The self-test may run next to a normal instance, so it skips the lock.
+if (!SELFTEST && !app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', (e, argv) => {
+    const file = fileFromArgs(argv);
+    if (file) return openFromOS(file);
+    if (!win) return;
+    if (win.isMinimized()) win.restore();
+    win.focus();
+  });
+  app.on('open-file', (e, file) => {
+    e.preventDefault();
+    openFromOS(file);
+  });
+  app.on('window-all-closed', () => app.quit());
+
+  app.whenReady().then(() => {
+    createWindow();
+    log(`start ${app.getVersion()}`);
+    if (SELFTEST) {
+      fs.mkdirSync(OUT, { recursive: true });
+      require('./selftest')({ win, out: OUT }).catch(err => {
+        console.error(err);
+        app.exit(1);
+      });
+    }
+  });
 }
-if (process.platform === 'win32') app.setAppUserModelId('io.github.artsocity23ux.artframes');
-
-app.on('second-instance', () => win?.focus());
-app.on('open-file', (e, file) => {
-  e.preventDefault();
-  if (win) win.webContents.send('af:open-file', file);
-  else pendingFile = file;
-});
-app.on('window-all-closed', () => app.quit());
-
-app.whenReady().then(() => {
-  createWindow();
-  log(`start ${app.getVersion()}`);
-  if (SELFTEST) {
-    require(BENCH ? './bench' : DEMO ? './demo' : './selftest')({ win, out: OUT }).catch(err => {
-      console.error(err);
-      app.exit(1);
-    });
-  }
-});

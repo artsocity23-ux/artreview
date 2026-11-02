@@ -1,4 +1,4 @@
-// Renders the ArtFrames icon (a sheet of paper with a ball and its onion-skin ghosts, red behind and green ahead)
+// Renders the ArtReview icon (a film frame with a play triangle and a red map pin stuck into it, like a note on a shot)
 // with signed distance fields and writes icon.png, icon.ico and build/icon.png for the installers. Run once: `node make-icon.js`.
 const fs = require('fs');
 const path = require('path');
@@ -13,13 +13,56 @@ const roundRect = (cx, cy, hw, hh, r) => ([x, y]) => {
 };
 const circle = (cx, cy, r) => ([x, y]) => Math.hypot(x - cx, y - cy) - r;
 
+// Exact distance to a convex polygon (points in clockwise screen order), negative inside.
+const polygon = pts => ([x, y]) => {
+  let d = Infinity;
+  let inside = true;
+  for (let i = 0; i < pts.length; i++) {
+    const [ax, ay] = pts[i];
+    const [bx, by] = pts[(i + 1) % pts.length];
+    const ex = bx - ax;
+    const ey = by - ay;
+    const t = Math.max(0, Math.min(1, ((x - ax) * ex + (y - ay) * ey) / (ex * ex + ey * ey)));
+    d = Math.min(d, Math.hypot(x - ax - t * ex, y - ay - t * ey));
+    if (ex * (y - ay) - ey * (x - ax) < 0) inside = false;
+  }
+  return inside ? -d : d;
+};
+const union = (...shapes) => p => Math.min(...shapes.map(s => s(p)));
+const grow = (shape, r) => p => shape(p) - r;
+
+// Map pin: a circle with a point below it, the sides tangent to the circle.
+function pin(cx, cy, r, tipY) {
+  const d = tipY - cy;
+  const s = r / d;
+  const c = Math.sqrt(1 - s * s);
+  return union(circle(cx, cy, r), polygon([[cx - r * c, cy + r * s], [cx + r * c, cy + r * s], [cx, tipY]]));
+}
+
+const BG = '#1f232b';
+const FILM = '#e9e6df';
+const PICTURE = '#2d323d';
+const PIN = pin(0.71, 0.55, 0.15, 0.9);
+
+// Sprocket holes along the top and bottom edge of the film frame.
+const holes = [];
+for (let i = 0; i < 6; i++) {
+  const x = 0.15 + i * 0.112;
+  holes.push([roundRect(x, 0.235, 0.028, 0.02, 0.008), hex(BG), 1]);
+  holes.push([roundRect(x, 0.705, 0.028, 0.02, 0.008), hex(BG), 1]);
+}
+
 // Shapes in 0..1 icon space, painted back to front: [sdf, colour, opacity].
 const LAYERS = [
-  [roundRect(0.5, 0.5, 0.5, 0.5, 0.22), hex('#1f232b'), 1],
-  [roundRect(0.5, 0.52, 0.36, 0.3, 0.05), hex('#f3f1ec'), 1],
-  [circle(0.29, 0.67, 0.105), hex('#ff5a4e'), 0.5],
-  [circle(0.71, 0.37, 0.105), hex('#1fb35a'), 0.5],
-  [circle(0.5, 0.52, 0.125), hex('#1b1b1f'), 1],
+  [roundRect(0.5, 0.5, 0.5, 0.5, 0.22), hex(BG), 1],
+  [roundRect(0.43, 0.47, 0.35, 0.285, 0.05), hex(FILM), 1],
+  ...holes,
+  [roundRect(0.43, 0.47, 0.35, 0.185, 0.025), hex(PICTURE), 1],
+  [polygon([[0.33, 0.37], [0.5, 0.47], [0.33, 0.57]]), hex(FILM), 1],
+  // a background-coloured rim cuts the pin out of the frame so it reads at 16 px
+  [grow(PIN, 0.03), hex(BG), 1],
+  [PIN, hex('#ff5a4e'), 1],
+  [circle(0.71, 0.55, 0.06), hex('#ffffff'), 1],
 ];
 
 function render(size) {
