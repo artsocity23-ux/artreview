@@ -1,779 +1,581 @@
 // End-to-end check without a human: `electron . --selftest <outdir>`.
-// Draws a bouncing ball over several frames with real mouse input and a pen with pressure (Chrome DevTools input,
-// which arrives as PointerEvents of type "pen"), checks the onion skin, undo and frame operations, plays it back,
-// generates a test video with a frame counter and a tone, traces over it, draws an own reference under the frames,
-// and exports PNG, GIF, WebM and MP4.
-// Writes report.json plus screenshots; exits 1 if any check fails.
-const { app, BrowserWindow } = require('electron');
+// Makes its own test shot (a textured square moving over noise, a frame counter, a tone), then with real mouse and
+// keyboard input: pins a note, outlines the square so a second note follows it, edits in/out with I/O, undoes and
+// redoes, exports through the copy button path, reads the system clipboard back (Windows), saves / reopens the notes
+// and checks the silent autosave restore.
+// Writes report.json plus screenshots into <outdir>; exits 1 if any check fails.
+const { app, clipboard, ClipboardItem } = require('electron');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
 const wait = ms => new Promise(r => setTimeout(r, ms));
+const W = 640;
+const H = 360;
+const FPS = 24;
+const N = 120;
+const TEXT_PIN = 'Тінь темніша, ніж на референсі';
+const TEXT_OBJ = 'Прибрати відблиск на склі';
+const PALETTE = ['#ff5a4e', '#ffc23d', '#3dd6ff', '#7ee26b', '#ff6bd6', '#ff9a3d', '#b48cff', '#ffffff'];
 
-// Counts the images in a GIF and sums their delays (walks the block structure; image data may contain any byte).
-function gifInfo(buf) {
-  let p = 13;
-  if (buf[10] & 0x80) p += 3 * (1 << ((buf[10] & 7) + 1));
-  let frames = 0;
-  let delay = 0;
-  const skipSub = () => {
-    while (buf[p]) p += buf[p] + 1;
-    p++;
-  };
-  while (p < buf.length) {
-    const b = buf[p++];
-    if (b === 0x3b) break;
-    if (b === 0x21) {
-      const label = buf[p++];
-      if (label === 0xf9) delay += buf.readUInt16LE(p + 2);
-      skipSub();
-    } else if (b === 0x2c) {
-      const flags = buf[p + 8];
-      p += 9;
-      if (flags & 0x80) p += 3 * (1 << ((flags & 7) + 1));
-      p++; // LZW minimum code size
-      skipSub();
-      frames++;
-    } else {
-      throw new Error(`bad GIF block 0x${b.toString(16)} at ${p - 1}`);
-    }
-  }
-  return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8), frames, seconds: delay / 100 };
-}
+// Ground truth of the moving square, shared by the generator (in the renderer) and the checks (here).
+const CENTRE = 'i => [320 + 200 * Math.sin(i / 120 * Math.PI * 2), 180 + 90 * Math.sin(i / 120 * Math.PI * 4)]';
+const centre = i => [320 + 200 * Math.sin((i / 120) * Math.PI * 2), 180 + 90 * Math.sin((i / 120) * Math.PI * 4)];
+
+// Files the self-test writes into its folder; only these are removed before a run (the folder may be anyone's).
+const OWN_FILES = /^(report\.json|shot_010\.mp4|other_shot\.mp4|notes\.artreview|\d\d-[a-z-]+\.png)$/;
 
 const HELPERS = `
 window.__t = {
-  // Drawings and scene layers live on the GPU; __af reads them back as premultiplied RGBA.
-  ink(i) {
-    const d = __af.readFrame(i);
-    if (!d) return 0;
-    let n = 0;
-    for (let k = 3; k < d.length; k += 4) if (d[k] > 127) n++;
-    return n;
-  },
-  // Length of opaque run along a line through (x, y) in direction (dx, dy), in pixels.
-  thickness(i, x, y, dx, dy, reach) {
-    const d = __af.readFrame(i), W = __af.doc.width;
-    const n = Math.hypot(dx, dy); dx /= n; dy /= n;
-    let hits = 0;
-    for (let s = -reach; s <= reach; s += 0.25) {
-      const px = Math.round(x + dx * s), py = Math.round(y + dy * s);
-      if (d[(py * W + px) * 4 + 3] > 127) hits++;
-    }
-    return hits * 0.25;
-  },
-  tints() {
-    const d = __af.readLayer('onion');
-    let red = 0, green = 0;
-    for (let k = 0; k < d.length; k += 4) {
-      const a = d[k + 3];
-      if (a < 20) continue;
-      const r = d[k] * 255 / a, g = d[k + 1] * 255 / a;
-      if (r > g + 40) red++;
-      else if (g > r + 40) green++;
-    }
-    return { red, green };
-  },
-  refPixel(x, y) { return [...__af.readLayer('ref', x, y, 1, 1)]; },
-  scenePixel(x, y) { return [...__af.readLayer('scene', x, y, 1, 1)]; },
-  // The brush cursor drawn over the stage: whether it shows, and where (window coordinates of its centre).
-  cursor() {
-    const st = document.getElementById('stage'), c = document.getElementById('cursor'), r = st.getBoundingClientRect();
-    const m = /translate\\(([-\\d.]+)px, ([-\\d.]+)px\\)/.exec(c.style.transform) || [0, NaN, NaN];
-    return { shown: getComputedStyle(c).display !== 'none', x: +m[1] + r.left, y: +m[2] + r.top };
-  },
-  sketchInk() {
-    const d = __af.readLayer('sketch');
-    let n = 0;
-    for (let k = 3; k < d.length; k += 4) if (d[k] > 127) n++;
-    return n;
-  },
-  // A solid pixel inside the own reference where no frame has ink: where to look for it in the scene and exports.
-  sketchSpot() {
-    const s = __af.readLayer('sketch'), W = __af.doc.width, row = W * 4 * 2;
-    const frames = __af.doc.frames.map((f, i) => __af.readFrame(i)).filter(Boolean);
-    for (let k = 3 + row; k < s.length - row; k += 4) {
-      if (s[k] < 255 || s[k - row] < 255 || s[k + row] < 255 || frames.some(d => d[k] > 0)) continue;
-      const p = (k - 3) / 4;
-      return [p % W, Math.floor(p / W)];
-    }
-    return null;
-  },
-  // Share of the inked pixels of a that are inked in b too.
-  covered(a, b) {
-    let n = 0, both = 0;
-    for (let k = 3; k < a.length; k += 4) if (a[k] > 127) { n++; if (b[k] > 127) both++; }
-    return n ? both / n : 0;
-  },
-  pixel(canvas, x, y) {
+  async mb() { return import('./node_modules/mediabunny/dist/bundles/mediabunny.min.mjs'); },
+  centre: ${CENTRE},
+  // RGB at points of a canvas (read through a 1x1 copy: the decoder's canvas is not made for readback)
+  pixels(canvas, pts) {
     const c = document.createElement('canvas');
     c.width = 1; c.height = 1;
     const g = c.getContext('2d', { willReadFrequently: true });
-    g.drawImage(canvas, x, y, 1, 1, 0, 0, 1, 1);
-    return [...g.getImageData(0, 0, 1, 1).data];
+    return pts.map(([x, y]) => {
+      g.drawImage(canvas, Math.round(x), Math.round(y), 1, 1, 0, 0, 1, 1);
+      return [...g.getImageData(0, 0, 1, 1).data].slice(0, 3);
+    });
   },
-  async mb() { return import('./node_modules/mediabunny/dist/bundles/mediabunny.min.mjs'); },
 };
 true`;
 
-// 2 s, 24 fps, 640x360: a grey square whose level is 5 x frame number (to check frame sync), a moving ball, a 440 Hz tone.
-const MAKE_VIDEO = file => `(async () => {
+// 640x360, 24 fps: a noisy textured background, a textured 60x60 square on a smooth path, a frame counter, a tone.
+const MAKE_VIDEO = (file, frames, withSquare) => `(async () => {
   const mb = await __t.mb();
-  const W = 640, H = 360, FPS = 24, N = 48;
+  const W = ${W}, H = ${H}, FPS = ${FPS}, N = ${frames};
   const c = document.createElement('canvas'); c.width = W; c.height = H;
   const g = c.getContext('2d');
+  let seed = 7;
+  const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const bg = document.createElement('canvas'); bg.width = W; bg.height = H;
+  const bgc = bg.getContext('2d');
+  const img = bgc.createImageData(W, H);
+  for (let i = 0; i < W * H; i++) {
+    const v = 60 + rnd() * 70;
+    img.data[i * 4] = v * 0.8; img.data[i * 4 + 1] = v; img.data[i * 4 + 2] = v * 1.1; img.data[i * 4 + 3] = 255;
+  }
+  bgc.putImageData(img, 0, 0);
+  const sq = document.createElement('canvas'); sq.width = 60; sq.height = 60;
+  const sqc = sq.getContext('2d');
+  for (let y = 0; y < 60; y += 6) for (let x = 0; x < 60; x += 6) {
+    sqc.fillStyle = 'hsl(' + Math.floor(rnd() * 360) + ',80%,' + (30 + rnd() * 50) + '%)';
+    sqc.fillRect(x, y, 6, 6);
+  }
   const output = new mb.Output({ format: new mb.Mp4OutputFormat({ fastStart: 'in-memory' }), target: new mb.BufferTarget() });
   const vcodec = await mb.getFirstEncodableVideoCodec(['avc', 'vp9'], { width: W, height: H });
-  const video = new mb.CanvasSource(c, { codec: vcodec, quality: mb.QUALITY_VERY_HIGH, keyFrameInterval: 0.5 });
+  const video = new mb.CanvasSource(c, { codec: vcodec, quality: mb.QUALITY_HIGH, keyFrameInterval: 2 });
   output.addVideoTrack(video, { frameRate: FPS });
   const acodec = await mb.getFirstEncodableAudioCodec(['aac', 'opus']);
   const sound = acodec && new mb.AudioBufferSource({ codec: acodec, quality: mb.QUALITY_MEDIUM });
   if (sound) output.addAudioTrack(sound);
   await output.start();
   for (let i = 0; i < N; i++) {
-    g.fillStyle = '#3a5f7a'; g.fillRect(0, 0, W, H);
-    g.fillStyle = '#f0c040'; g.beginPath(); g.arc(90 + i * 10, 230, 42, 0, Math.PI * 2); g.fill();
-    g.fillStyle = 'rgb(' + i * 5 + ',' + i * 5 + ',' + i * 5 + ')'; g.fillRect(0, 0, 48, 48);
-    g.fillStyle = '#fff'; g.font = 'bold 72px Segoe UI'; g.fillText(String(i), 420, 120);
+    g.drawImage(bg, 0, 0);
+    if (${withSquare}) {
+      const [cx, cy] = __t.centre(i);
+      g.drawImage(sq, cx - 30, cy - 30);
+    }
+    g.fillStyle = '#fff'; g.font = 'bold 28px Segoe UI'; g.fillText(String(i), 10, 34);
     await video.add(i / FPS, 1 / FPS);
   }
   if (sound) {
-    const sr = 48000, ab = new AudioBuffer({ length: sr * 2, numberOfChannels: 2, sampleRate: sr });
-    for (let ch = 0; ch < 2; ch++) { const d = ab.getChannelData(ch); for (let k = 0; k < d.length; k++) d[k] = 0.25 * Math.sin(2 * Math.PI * 440 * k / sr); }
+    const sr = 48000, ab = new AudioBuffer({ length: sr * N / FPS, numberOfChannels: 2, sampleRate: sr });
+    for (let ch = 0; ch < 2; ch++) { const d = ab.getChannelData(ch); for (let k = 0; k < d.length; k++) d[k] = 0.2 * Math.sin(2 * Math.PI * 440 * k / sr); }
     await sound.add(ab);
   }
   await output.finalize();
-  await af.write(${JSON.stringify(file)}, new Uint8Array(output.target.buffer));
+  await ar.write(${JSON.stringify(file)}, new Uint8Array(output.target.buffer));
   return { vcodec, acodec };
 })()`;
 
-// 10 s at 30000/1001 fps: squares at x 0 and 48 encode the frame index as (i % 50) * 5 and floor(i / 50) * 40.
-const MAKE_NTSC = file => `(async () => {
+// Facts about an exported file, plus pixels at given points of one frame of it and of the same frame of the source.
+const PROBE = (file, source, frame, pts) => `(async () => {
   const mb = await __t.mb();
-  const W = 640, H = 360, N = 300, FPS = 30000 / 1001;
-  const c = document.createElement('canvas'); c.width = W; c.height = H;
-  const g = c.getContext('2d');
-  const output = new mb.Output({ format: new mb.Mp4OutputFormat({ fastStart: 'in-memory' }), target: new mb.BufferTarget() });
-  const video = new mb.CanvasSource(c, { codec: 'avc', quality: mb.QUALITY_VERY_HIGH, keyFrameInterval: 2 });
-  output.addVideoTrack(video, { frameRate: FPS });
-  await output.start();
-  for (let i = 0; i < N; i++) {
-    g.fillStyle = '#2d4a3a'; g.fillRect(0, 0, W, H);
-    const a = (i % 50) * 5, b = Math.floor(i / 50) * 40;
-    g.fillStyle = 'rgb(' + a + ',' + a + ',' + a + ')'; g.fillRect(0, 0, 48, 48);
-    g.fillStyle = 'rgb(' + b + ',' + b + ',' + b + ')'; g.fillRect(48, 0, 48, 48);
-    g.fillStyle = '#fff'; g.font = 'bold 72px Segoe UI'; g.fillText(String(i), 380, 140);
-    await video.add(i * 1001 / 30000, 1001 / 30000);
-  }
-  await output.finalize();
-  await af.write(${JSON.stringify(file)}, new Uint8Array(output.target.buffer));
-  return true;
-})()`;
-
-const PROBE = (file, at) => `(async () => {
-  const mb = await __t.mb();
-  const input = new mb.Input({ formats: mb.ALL_FORMATS, source: new mb.BlobSource(new Blob([await af.read(${JSON.stringify(file)})])) });
+  const open = async f => new mb.Input({ formats: mb.ALL_FORMATS, source: new mb.BlobSource(new Blob([await ar.read(f)])) });
+  const input = await open(${JSON.stringify(file)});
   const v = await input.getPrimaryVideoTrack();
   const a = await input.getPrimaryAudioTrack();
-  const out = { duration: +(await input.computeDuration()).toFixed(3), width: v.displayWidth, height: v.displayHeight, video: v.codec, audio: a ? a.codec : null };
-  out.fps = +(await v.computePacketStats()).averagePacketRate.toFixed(2);
-  if (${JSON.stringify(at || null)}) {
-    const sink = new mb.CanvasSink(v);
-    out.samples = {};
-    for (const [name, t, x, y] of ${JSON.stringify(at || [])}) out.samples[name] = __t.pixel((await sink.getCanvas(t)).canvas, x, y);
-  }
+  const out = {
+    duration: await input.computeDuration(),
+    width: await v.getDisplayWidth(), height: await v.getDisplayHeight(),
+    video: await v.getCodec(), audio: a ? await a.getCodec() : null,
+    audioDuration: a ? await a.computeDuration() : 0,
+  };
+  let frames = 0;
+  for await (const p of new mb.EncodedPacketSink(v).packets(undefined, undefined, { metadataOnly: true })) frames++;
+  out.frames = frames;
+  const sink = new mb.CanvasSink(v);
+  const at = (await sink.getCanvas((${frame} + 0.5) / ${FPS})).canvas;
+  out.exported = __t.pixels(at, ${JSON.stringify(pts)});
+  window.__shots = { frame: at.toDataURL('image/png'), card: (await sink.getCanvas(out.duration - 0.5)).canvas.toDataURL('image/png') };
+  const src = await open(${JSON.stringify(source)});
+  const sv = await src.getPrimaryVideoTrack();
+  out.source = __t.pixels((await new mb.CanvasSink(sv).getCanvas((${frame} + 0.5) / ${FPS})).canvas, ${JSON.stringify(pts)});
   return out;
 })()`;
 
+const hexRGB = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const near = (p, rgb, tol) => p.every((v, i) => Math.abs(v - rgb[i]) <= tol);
+// Points on a ring inside a pin: clear of its white edge and of the number in the middle.
+const ring = (x, y, r, n = 12) => Array.from({ length: n }, (_, k) => [x + Math.cos((k / n) * 2 * Math.PI) * r, y + Math.sin((k / n) * 2 * Math.PI) * r]);
+
+// Reads the Windows clipboard the way a messenger sees it: the file drop list and the text.
+function readWinClipboard() {
+  const script = [
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+    '$f = @(Get-Clipboard -Format FileDropList | ForEach-Object { $_.FullName })',
+    '$t = Get-Clipboard -Raw',
+    'ConvertTo-Json -Compress @{ files = $f; text = $t }',
+  ].join('; ');
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return new Promise(resolve => {
+    execFile('powershell.exe', ['-NoProfile', '-STA', '-NonInteractive', '-EncodedCommand', encoded], { windowsHide: true, timeout: 20000, encoding: 'utf8' }, (err, stdout, stderr) => {
+      if (err) return resolve({ error: String(stderr || err.message) });
+      try {
+        const j = JSON.parse(stdout.trim());
+        resolve({ files: [].concat(j.files || []), text: j.text || '' });
+      } catch {
+        resolve({ error: `bad output: ${stdout}` });
+      }
+    });
+  });
+}
+
+// The user's clipboard goes back after the clipboard step: every format Electron can read, and the text for sure.
+// Kept in memory only; it is never written to the report or to disk.
+async function saveClipboard() {
+  const saved = { text: '', items: null };
+  saved.text = await clipboard.readText().catch(() => '');
+  try {
+    saved.items = [];
+    for (const item of await clipboard.read()) {
+      const entry = {};
+      for (const type of item.types) {
+        try {
+          entry[type] = await item.getType(type);
+        } catch {
+          // a format that cannot be read cannot be restored either
+        }
+      }
+      if (Object.keys(entry).length) saved.items.push(entry);
+    }
+  } catch {
+    saved.items = null;
+  }
+  return saved;
+}
+
+async function restoreClipboard(saved) {
+  try {
+    if (saved.items?.length && ClipboardItem) await clipboard.write(saved.items.map(e => new ClipboardItem(e)));
+  } catch {
+    // the text below still goes back
+  }
+  let now = await clipboard.readText().catch(() => null);
+  if (now !== saved.text) {
+    if (saved.text) await clipboard.writeText(saved.text);
+    else clipboard.clear();
+    now = await clipboard.readText().catch(() => null);
+  }
+  return now === saved.text;
+}
+
 module.exports = async function selftest({ win, out }) {
   fs.mkdirSync(out, { recursive: true });
-  for (const f of fs.readdirSync(out)) fs.rmSync(path.join(out, f), { recursive: true, force: true });
+  for (const f of fs.readdirSync(out)) if (OWN_FILES.test(f)) fs.rmSync(path.join(out, f), { force: true });
+  for (const [dir, re] of [['reviews', /\.artreview$/], ['ArtReview', /_notes_.*\.(mp4|md)$/]]) {
+    const d = path.join(out, dir);
+    if (fs.existsSync(d)) for (const f of fs.readdirSync(d)) if (re.test(f)) fs.rmSync(path.join(d, f), { force: true });
+  }
+
   const wc = win.webContents;
   const report = { console: [], checks: {} };
   const check = (name, ok, detail) => {
     report.checks[name] = { ok: !!ok, ...(detail === undefined ? {} : { detail }) };
+    console.log(`${ok ? 'ok  ' : 'FAIL'} ${name}${ok ? '' : ` ${JSON.stringify(detail)}`}`);
   };
+  const consoleErrors = () => report.console.filter(l => /^(error|3):/i.test(l) || /Uncaught|TypeError|ReferenceError/.test(l));
+  let finished = false;
+  const finish = code => {
+    if (finished) return;
+    finished = true;
+    report.errors = consoleErrors();
+    report.failed = Object.entries(report.checks).filter(([, c]) => !c.ok).map(([n]) => n);
+    fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2));
+    try {
+      wc.debugger.detach();
+    } catch {
+      // not attached
+    }
+    app.exit(code ?? (report.failed.length ? 1 : 0));
+  };
+  let clip = null; // the user's clipboard while the clipboard step holds it
+  // A hung step must still end the run with a report and a failure, and give the clipboard back.
+  const watchdog = setTimeout(async () => {
+    report.fatal = 'timeout: the self-test did not finish in 4 minutes';
+    if (clip) report.clipboardRestored = await restoreClipboard(clip).catch(() => false);
+    finish(1);
+  }, 240000);
+
   wc.on('console-message', e => report.console.push(`${e.level}: ${e.message}`));
   const js = code => wc.executeJavaScript(code);
   const shot = async name => fs.writeFileSync(path.join(out, name), (await wc.capturePage()).toPNG());
+  const saveDataURL = (name, url) => fs.writeFileSync(path.join(out, name), Buffer.from(url.split(',')[1], 'base64'));
 
-  await new Promise(r => (wc.isLoading() ? wc.once('did-finish-load', r) : r()));
-  await wait(1200);
-  win.focus();
-  wc.focus();
-  report.loaded = await js('!!(window.__af && __af.doc)');
-  if (!report.loaded) throw new Error(`app did not start: ${report.console.join(' | ')}`);
-  await js(HELPERS);
-  wc.debugger.attach('1.3');
-  const cdp = (method, params) => wc.debugger.sendCommand(method, params);
+  try {
+    await new Promise(r => (wc.isLoading() ? wc.once('did-finish-load', r) : r()));
+    await wait(1200);
+    win.focus();
+    wc.focus();
+    report.loaded = await js('!!(window.__ar && window.ar)');
+    if (!report.loaded) throw new Error(`app did not start: ${report.console.join(' | ')}`);
+    await js(HELPERS);
+    wc.debugger.attach('1.3');
+    const cdp = (method, params) => wc.debugger.sendCommand(method, params);
 
-  const key = async (keyCode, modifiers = []) => {
-    wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
-    wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
-    await wait(90);
-  };
-  let rect;
-  const measure = async () => {
-    rect = await js("(() => { const r = document.getElementById('sheet').getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height }; })()");
-  };
-  const at = (fx, fy) => [rect.x + rect.w * fx, rect.y + rect.h * fy];
-  const mouse = async pts => {
-    const [x, y] = pts[0].map(Math.round);
-    wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
-    for (const p of pts.slice(1)) {
-      const [mx, my] = p.map(Math.round);
-      wc.sendInputEvent({ type: 'mouseMove', x: mx, y: my, button: 'left', modifiers: ['leftButtonDown'] });
-      await wait(8);
-    }
-    const [ex, ey] = pts[pts.length - 1].map(Math.round);
-    wc.sendInputEvent({ type: 'mouseUp', x: ex, y: ey, button: 'left', clickCount: 1 });
-    await wait(120);
-  };
-  // Pen with pressure; pts are [x, y, pressure].
-  const pen = async pts => {
-    const ev = (type, [x, y, force]) => cdp('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: 1, pointerType: 'pen', force });
-    await ev('mousePressed', pts[0]);
-    for (const p of pts.slice(1)) {
-      await ev('mouseMoved', p);
-      await wait(6);
-    }
-    await ev('mouseReleased', pts[pts.length - 1]);
-    await wait(120);
-  };
-  const line = (a, b, n = 24) => Array.from({ length: n + 1 }, (_, i) => [a[0] + ((b[0] - a[0]) * i) / n, a[1] + ((b[1] - a[1]) * i) / n]);
-  const ring = (fx, fy, rx, ry, n = 56) => Array.from({ length: n + 1 }, (_, i) => {
-    const t = (i / n) * Math.PI * 2.08;
-    return at(fx + Math.cos(t) * rx, fy + Math.sin(t) * ry);
-  });
-  const state = () => js('({ frames: __af.doc.frames.length, cur: __af.cur, holds: __af.doc.frames.map(f => f.hold), undo: __af.undoDepth, playing: __af.playing })');
+    const key = async (keyCode, modifiers = [], times = 1) => {
+      for (let i = 0; i < times; i++) {
+        wc.sendInputEvent({ type: 'keyDown', keyCode, modifiers });
+        wc.sendInputEvent({ type: 'keyUp', keyCode, modifiers });
+        await wait(70);
+      }
+      await wait(60);
+    };
+    const click = async (x, y) => {
+      [x, y] = [Math.round(x), Math.round(y)];
+      wc.sendInputEvent({ type: 'mouseMove', x, y });
+      wc.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 });
+      wc.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 });
+      await wait(200);
+    };
+    const drag = async (a, b, steps = 12) => {
+      const p = t => [Math.round(a[0] + (b[0] - a[0]) * t), Math.round(a[1] + (b[1] - a[1]) * t)];
+      wc.sendInputEvent({ type: 'mouseMove', x: p(0)[0], y: p(0)[1] });
+      wc.sendInputEvent({ type: 'mouseDown', x: p(0)[0], y: p(0)[1], button: 'left', clickCount: 1 });
+      for (let k = 1; k <= steps; k++) {
+        const [x, y] = p(k / steps);
+        wc.sendInputEvent({ type: 'mouseMove', x, y, button: 'left', modifiers: ['leftButtonDown'] });
+        await wait(12);
+      }
+      wc.sendInputEvent({ type: 'mouseUp', x: p(1)[0], y: p(1)[1], button: 'left', clickCount: 1 });
+      await wait(200);
+    };
+    const typeText = async text => {
+      await cdp('Input.insertText', { text });
+      await wait(150);
+    };
+    // Video pixel -> window point, through the picture rect the app reports.
+    let rect;
+    const at = (x, y) => [rect.x + (rect.width * x) / W, rect.y + (rect.height * y) / H];
+    const tool = () => js("document.querySelector('#tools button.on')?.dataset.tool || null");
+    const notes = () => js('JSON.parse(JSON.stringify(__ar.review ? __ar.review.notes : []))');
+    // Waits until the decoder has put the current frame on screen.
+    const settle = async () => {
+      for (let i = 0; i < 100; i++) {
+        if (await js('!__ar.video || __ar.video.shown === __ar.cur')) break;
+        await wait(20);
+      }
+      await wait(150);
+    };
+    // RGB of the window at window points (capturePage may be in device pixels).
+    const screenPixels = async pts => {
+      const img = await wc.capturePage();
+      const { width: iw, height: ih } = img.getSize();
+      const s = iw / (await js('innerWidth'));
+      const bmp = img.toBitmap(); // BGRA
+      return pts.map(([x, y]) => {
+        const px = Math.min(iw - 1, Math.round(x * s));
+        const py = Math.min(ih - 1, Math.round(y * s));
+        const k = (py * iw + px) * 4;
+        return [bmp[k + 2], bmp[k + 1], bmp[k]];
+      });
+    };
 
-  // ---------- 1. bouncing ball, frame by frame ----------
-  await js('__af.setDoc({ width: 1280, height: 720, fps: 12 })');
-  await wait(300);
-  await measure();
-  report.sheet = rect;
-
-  await key('B');
-  await mouse(line(at(0.05, 0.9), at(0.95, 0.9), 30)); // the ground
-  await mouse(ring(0.16, 0.22, 0.05, 0.088));
-  await key('N');
-  await mouse(ring(0.31, 0.5, 0.05, 0.088));
-  await key('N');
-  // Squash on the ground, drawn with the pen: pressure grows from light to full along the stroke.
-  const squash = ring(0.46, 0.8, 0.068, 0.07, 64).map(([x, y], i, a) => [x, y, 0.15 + (0.85 * i) / (a.length - 1)]);
-  await key('3');
-  await pen(squash);
-  await key('1');
-  await key('N');
-  await mouse(ring(0.61, 0.5, 0.05, 0.088));
-  await key('N');
-  await key('F');
-  await mouse(ring(0.76, 0.24, 0.05, 0.088, 72)); // a calligraphic ring with the flat brush
-  // Flat brush direction test on the same frame: "/" runs along the 45° nib (thin), "\" across it (wide).
-  await mouse(line(at(0.86, 0.75), at(0.95, 0.59), 30));
-  await mouse(line(at(0.86, 0.42), at(0.95, 0.58), 30));
-  await key('B');
-
-  let s = await state();
-  check('five frames drawn', s.frames === 5 && s.cur === 4, s);
-  const inks = await js('__af.doc.frames.map((f, i) => __t.ink(i))');
-  check('every frame has ink', inks.every(n => n > 500), inks);
-
-  const W = 1280;
-  const H = 720;
-  const mid = (a, b) => [(a[0] + b[0]) / 2 * W, (a[1] + b[1]) / 2 * H];
-  const thin = mid([0.86, 0.75], [0.95, 0.59]);
-  const wide = mid([0.86, 0.42], [0.95, 0.58]);
-  // Measure perpendicular to each stroke (in document pixels).
-  const tThin = await js(`__t.thickness(4, ${thin[0]}, ${thin[1]}, ${0.16 * H}, ${0.09 * W}, 40)`);
-  const tWide = await js(`__t.thickness(4, ${wide[0]}, ${wide[1]}, ${0.16 * H}, ${-0.09 * W}, 40)`);
-  check('flat brush: width depends on direction', tWide > tThin * 3, { alongNib: tThin, acrossNib: tWide, size: 22 });
-
-  // Pressure: the squash ring starts light and ends heavy. Compare stroke width near the start and near the end.
-  const p0 = squash[4];
-  const p1 = squash[56];
-  const toDocPt = ([x, y]) => [((x - rect.x) / rect.w) * W, ((y - rect.y) / rect.h) * H];
-  const [ax, ay] = toDocPt(p0);
-  const [bx, by] = toDocPt(p1);
-  const cx = 0.46 * W;
-  const cy = 0.8 * H;
-  const tLight = await js(`__t.thickness(2, ${ax}, ${ay}, ${ax - cx}, ${ay - cy}, 20)`);
-  const tHeavy = await js(`__t.thickness(2, ${bx}, ${by}, ${bx - cx}, ${by - cy}, 20)`);
-  check('pen pressure changes width', tHeavy > tLight * 2, { light: tLight, heavy: tHeavy });
-
-  // ---------- 2. onion skin ----------
-  await key('Left');
-  await key('Left');
-  s = await state();
-  const tints = await js('__t.tints()');
-  check('onion skin shows previous (red) and next (green)', s.cur === 2 && tints.red > 300 && tints.green > 300, tints);
-  await wait(300);
-  await shot('onion.png');
-
-  // ---------- 3. undo / redo ----------
-  const before = await js('__t.ink(2)');
-  await mouse(line(at(0.38, 0.95), at(0.54, 0.95), 12));
-  const drawn = await js('__t.ink(2)');
-  await key('Z', ['control']);
-  const undone = await js('__t.ink(2)');
-  await key('Y', ['control']);
-  const redone = await js('__t.ink(2)');
-  await key('Z', ['control']);
-  check('undo and redo a stroke', drawn > before && undone === before && redone === drawn && (await js('__t.ink(2)')) === before, { before, drawn, undone, redone });
-
-  // ---------- 4. frame operations ----------
-  await key('D');
-  s = await state();
-  const dupOk = s.frames === 6 && s.cur === 3 && (await js('__t.ink(3)')) === before;
-  await key('=');
-  const holdUp = (await state()).holds[3];
-  await key('-');
-  await key('-');
-  const holdDown = (await state()).holds[3];
-  await key('Right', ['alt']);
-  const moved = (await state()).cur;
-  await key('Delete', ['shift']);
-  s = await state();
-  check('duplicate, hold, move, delete', dupOk && holdUp === 3 && holdDown === 1 && moved === 4 && s.frames === 5, { dupOk, holdUp, holdDown, moved, after: s });
-
-  // ---------- 5. playback ----------
-  await key('Home');
-  const seen = new Set();
-  wc.sendInputEvent({ type: 'keyDown', keyCode: 'Space' });
-  wc.sendInputEvent({ type: 'keyUp', keyCode: 'Space' });
-  for (let k = 0; k < 24; k++) {
-    await wait(50);
-    seen.add(await js('__af.cur'));
-  }
-  const wasPlaying = await js('__af.playing');
-  await key('Space');
-  s = await state();
-  check('playback runs through frames', wasPlaying && seen.size >= 4 && !s.playing, { seen: [...seen] });
-
-  // ---------- 6. save and export the animation ----------
-  const project = path.join(out, 'ball.artframes');
-  await js(`__af.save(${JSON.stringify(project)})`);
-  report.inksSaved = await js('__af.doc.frames.map((f, i) => __t.ink(i))');
-  const total = s.holds.reduce((a, b) => a + b, 0);
-
-  const pngDir = path.join(out, 'png');
-  let r = await js(`__af.exportTo({ kind: 'png', target: ${JSON.stringify(pngDir)}, name: 'ball', scale: 1, withRef: false, transparent: true })`);
-  const pngs = fs.existsSync(pngDir) ? fs.readdirSync(pngDir).filter(f => f.endsWith('.png')).sort() : [];
-  const pngHead = pngs[0] && fs.readFileSync(path.join(pngDir, pngs[0]));
-  check('PNG sequence: one file per tick', pngs.length === total && pngHead.readUInt32BE(16) === 1280 && pngHead.readUInt32BE(20) === 720, { files: pngs.length, total, first: pngs[0] });
-
-  const gifFile = path.join(out, 'ball.gif');
-  await js(`__af.exportTo({ kind: 'gif', target: ${JSON.stringify(gifFile)}, name: 'ball', scale: 0.5, withRef: false })`);
-  const gif = fs.existsSync(gifFile) && gifInfo(fs.readFileSync(gifFile));
-  check('GIF: one image per drawing, timing kept', gif && gif.frames === 5 && gif.width === 640 && Math.abs(gif.seconds - total / 12) < 0.05, gif);
-
-  const webm = path.join(out, 'ball.webm');
-  r = await js(`__af.exportTo({ kind: 'webm', target: ${JSON.stringify(webm)}, name: 'ball', scale: 0.5, withRef: false })`);
-  const webmInfo = await js(PROBE(webm));
-  check('WebM animation', Math.abs(webmInfo.duration - total / 12) < 0.1 && webmInfo.width === 640, { ...webmInfo, codec: r.codec });
-
-  // ---------- 7. video reference ----------
-  const videoFile = path.join(out, 'test-video.mp4');
-  report.testVideo = await js(MAKE_VIDEO(videoFile));
-  await js('__af.setDoc({ width: 1920, height: 1080, fps: 24 })');
-  await js(`__af.loadReference(${JSON.stringify(videoFile)})`);
-  await wait(500);
-  s = await state();
-  const docInfo = await js('({ w: __af.doc.width, h: __af.doc.height, fps: __af.doc.fps, vfps: __af.ref.fps, hasAudio: __af.ref.hasAudio })');
-  check('empty project adopts the video', docInfo.w === 640 && docInfo.h === 360 && docInfo.fps === 24 && s.frames === 24 && s.holds.every(h => h === 2), { ...docInfo, frames: s.frames });
-
-  // Step through frames: frame i starts at tick 2i, so the grey square must read about 10 * i.
-  const levels = [];
-  for (let i = 0; i < 6; i++) {
-    if (i) await key('Right');
-    for (let k = 0; k < 40; k++) {
-      if (await js('__af.ref.shownTick === __af.cur * 2')) break;
-      await wait(25);
-    }
-    levels.push((await js('__t.refPixel(20, 20)'))[0]);
-  }
-  check('video reference follows the frames', levels.every((v, i) => Math.abs(v - 10 * i) <= 8), levels);
-
-  // Doodle in red on frames 2-4 (round on 2 and 3, flat on 4), right over the moving ball.
-  await key('Home');
-  await key('Right');
-  await measure();
-  await key('3');
-  await key('B');
-  await mouse(ring(0.35, 0.62, 0.05, 0.09));
-  await mouse(line(at(0.3, 0.45), at(0.4, 0.45), 10));
-  await key('Right');
-  await mouse(ring(0.38, 0.62, 0.05, 0.09));
-  await key('Right');
-  await key('F');
-  await mouse(ring(0.41, 0.62, 0.05, 0.09, 64));
-  await key('B');
-  await wait(400);
-  await shot('video.png');
-
-  // Playback with the video: the shown video frame must match the animation tick, and the sound must run.
-  await key('Home');
-  await wait(300);
-  wc.sendInputEvent({ type: 'keyDown', keyCode: 'Space' });
-  wc.sendInputEvent({ type: 'keyUp', keyCode: 'Space' });
-  const pairs = [];
-  for (let k = 0; k < 16; k++) {
-    await wait(70);
-    pairs.push(await js(`(() => {
-      const a = document.getElementById('audio');
-      return { tick: __af.doc.frames.slice(0, __af.cur).reduce((s, f) => s + f.hold, 0), video: Math.round(__t.refPixel(20, 20)[0] / 5), audio: +a.currentTime.toFixed(3), paused: a.paused };
+    await shot('01-empty.png');
+    check('empty state shows the drop zone and the notes hint', await js(`(() => {
+      const e = document.getElementById('empty'), h = document.getElementById('notesEmpty');
+      return getComputedStyle(e).display !== 'none' && !e.hidden && !h.hidden && /Перетягни сюди відео/.test(e.textContent);
     })()`));
-  }
-  await key('Space');
-  // Drawings change every 2 ticks, so the video may lead the drawing's start tick by up to 2 frames (plus one for timing).
-  const inSync = pairs.filter(p => p.video - p.tick >= -1 && p.video - p.tick <= 3).length;
-  const audioRan = pairs.some(p => !p.paused) && pairs[pairs.length - 1].audio > pairs[0].audio + 0.3;
-  check('playback over video: frames in sync, sound plays', new Set(pairs.map(p => p.video)).size >= 6 && inSync >= pairs.length * 0.8 && audioRan, pairs);
 
-  // Over-video MP4 with sound: at 0.1 s (video frame 2 = drawing 2) expect red ink at the line and the grey square ~10.
-  const mp4 = path.join(out, 'over-video.mp4');
-  r = await js(`__af.exportTo({ kind: 'mp4', target: ${JSON.stringify(mp4)}, name: 'over', scale: 1, withRef: true, audio: true })`);
-  const mp4Info = await js(PROBE(mp4, [['ink', 2.5 / 24, Math.round(0.35 * 640), Math.round(0.45 * 360)], ['square', 2.5 / 24, 20, 20], ['clean', 30.5 / 24, Math.round(0.35 * 640), Math.round(0.45 * 360)]]));
-  const ink = mp4Info.samples.ink;
-  const sq = mp4Info.samples.square;
-  check('MP4 over video keeps video, drawing and sound',
-    mp4Info.audio && Math.abs(mp4Info.duration - 2) < 0.1 && mp4Info.width === 640 && ink[0] > 150 && ink[1] < 110 && Math.abs(sq[0] - 10) <= 10,
-    { ...mp4Info, codec: r.codec, audioKept: r.audio });
+    // ---------- 1. open the video ----------
+    const shotFile = path.join(out, 'shot_010.mp4');
+    report.testVideo = await js(MAKE_VIDEO(shotFile, N, true));
+    await js(`__ar.open(${JSON.stringify(shotFile)}).then(() => true)`);
+    await settle();
+    rect = await js('__ar.stageRect()');
+    const v = await js('({ frames: __ar.video.frameCount, fps: __ar.video.fps, width: __ar.video.width, height: __ar.video.height, audio: __ar.video.hasAudio, notes: __ar.review.notes.length })');
+    check('1. video opens: 120 frames at 24 fps, 640x360, with sound', v.frames === N && Math.abs(v.fps - FPS) < 1e-6 && v.width === W && v.height === H && v.audio && v.notes === 0, v);
+    check('1. window title names the shot', win.getTitle() === 'ArtReview — shot_010.mp4', win.getTitle());
+    check('1. empty state is gone once a video is open', await js("getComputedStyle(document.getElementById('empty')).display === 'none' || document.getElementById('empty').hidden"));
+    await shot('02-opened.png');
 
-  const gifOver = path.join(out, 'over-video.gif');
-  await js(`__af.exportTo({ kind: 'gif', target: ${JSON.stringify(gifOver)}, name: 'over', scale: 0.5, withRef: true })`);
-  const gif2 = fs.existsSync(gifOver) && gifInfo(fs.readFileSync(gifOver));
-  check('GIF over video: one image per tick', gif2 && gif2.frames === 48 && gif2.width === 320 && Math.abs(gif2.seconds - 2) < 0.06, gif2);
+    // ---------- 2. pin tool: click, type, Enter ----------
+    await key('Home');
+    await key('Right', [], 5);
+    await settle();
+    const cur2 = await js('__ar.cur');
+    const tool2 = await tool();
+    await click(...at(100, 310));
+    const editorOpen = await js("!!__ar.editingId && !document.getElementById('editor').hidden && document.activeElement === document.getElementById('editor')");
+    await typeText(TEXT_PIN);
+    await wait(150);
+    await shot('03-typing.png');
+    await key('Enter');
+    let ns = await notes();
+    check('2. pin tool: click, type, Enter makes one note with the text at the current frame', cur2 === 5 && tool2 === 'pin' && editorOpen && ns.length === 1 &&
+      ns[0].text === TEXT_PIN && ns[0].in === 5 && ns[0].key === 5 && ns[0].out === 5 + 72 - 1 &&
+      Math.abs(ns[0].pin.x * W - 100) < 1.5 && Math.abs(ns[0].pin.y * H - 310) < 1.5 && ns[0].color === PALETTE[0] && !(await js('__ar.editingId')),
+    { cur: cur2, tool: tool2, editorOpen, notes: ns.map(n => ({ text: n.text, in: n.in, out: n.out, key: n.key, pin: n.pin })) });
+    check('2. the note is undoable', (await js('__ar.undoDepth')) === 1, await js('__ar.undoDepth'));
 
-  // ---------- 8. 29.97 fps: late frames must still line up ----------
-  const ntsc = path.join(out, 'ntsc.mp4');
-  await js(MAKE_NTSC(ntsc));
-  await js('__af.setDoc({ width: 1280, height: 720, fps: 24 })');
-  await js(`__af.loadReference(${JSON.stringify(ntsc)})`);
-  await wait(300);
-  const ntscDoc = await js('({ fps: __af.doc.fps, frames: __af.doc.frames.length, exact: __af.doc.fps === 30000 / 1001 })');
-  // Frame 140 starts at tick 280: draw a mark there and read which video frame the editor shows.
-  await js('__af.go(140)');
-  for (let k = 0; k < 80; k++) {
-    if (await js('__af.ref.shownTick === 280')) break;
-    await wait(25);
-  }
-  const decode = px => Math.round(px[1][0] / 40) * 50 + Math.round(px[0][0] / 5);
-  const shown = decode(await js('[__t.refPixel(20, 20), __t.refPixel(70, 20)]'));
-  await measure();
-  await key('3');
-  await mouse(line(at(0.4, 0.6), at(0.6, 0.6), 12));
-  const ntscMp4 = path.join(out, 'ntsc-over.mp4');
-  await js(`__af.exportTo({ kind: 'mp4', target: ${JSON.stringify(ntscMp4)}, name: 'ntsc', scale: 1, withRef: true, audio: false })`);
-  const T = j => (j + 0.5) * 1001 / 30000;
-  const probe = await js(PROBE(ntscMp4, [279, 280, 281, 282].map(j => [String(j), T(j), Math.round(0.5 * 640), Math.round(0.6 * 360)])));
-  const red = ([r, g]) => r > 150 && g < 110;
-  const marks = Object.fromEntries(Object.entries(probe.samples).map(([j, px]) => [j, red(px)]));
-  check('29.97 fps: frame 140 = video frame 280, in the editor and in the export',
-    ntscDoc.exact && ntscDoc.frames === 150 && shown === 280 && !marks[279] && marks[280] && marks[281] && !marks[282] && Math.abs(probe.fps - 29.97) < 0.01,
-    { ...ntscDoc, shown, marks, fps: probe.fps, duration: probe.duration });
-
-  // ---------- 9. reopen the saved project ----------
-  await js(`__af.open(${JSON.stringify(project)})`);
-  await wait(300);
-  const inksLoaded = await js('__af.doc.frames.map((f, i) => __t.ink(i))');
-  check('project reopens identical', JSON.stringify(inksLoaded) === JSON.stringify(report.inksSaved), { saved: report.inksSaved, loaded: inksLoaded });
-
-  // A picture as reference: loads under the drawing without touching the project size, exports underneath,
-  // travels inside the project file.
-  const picture = path.join(out, 'reference.png');
-  await js(`(async () => {
-    const c = document.createElement('canvas'); c.width = 800; c.height = 800;
-    const g = c.getContext('2d');
-    g.fillStyle = '#d9e8f5'; g.fillRect(0, 0, 800, 800);
-    g.fillStyle = '#2a7a4b'; g.fillRect(300, 300, 200, 200);
-    const blob = await new Promise(r => c.toBlob(r, 'image/png'));
-    await af.write(${JSON.stringify(picture)}, new Uint8Array(await blob.arrayBuffer()));
-    return true;
-  })()`);
-  await js(`__af.loadReference(${JSON.stringify(picture)})`);
-  const pic = await js('({ kind: __af.ref.kind, w: __af.doc.width, frames: __af.doc.frames.length, centre: __t.refPixel(640, 360), side: __t.refPixel(100, 360) })');
-  const withPic = path.join(out, 'with-picture.artframes');
-  await js(`__af.save(${JSON.stringify(withPic)})`);
-  const picPng = path.join(out, 'png-picture');
-  await js(`__af.exportTo({ kind: 'png', target: ${JSON.stringify(picPng)}, name: 'pic', scale: 0.5, withRef: true })`);
-  const firstPic = fs.existsSync(picPng) ? fs.readdirSync(picPng).sort()[0] : null;
-  const exported = firstPic ? await js(`(async () => {
-    const bmp = await createImageBitmap(new Blob([await af.read(${JSON.stringify(path.join(picPng, firstPic))})]));
-    return __t.pixel(bmp, 320, 180);
-  })()`) : null;
-  await js(`__af.open(${JSON.stringify(withPic)})`);
-  const reopened = await js('({ kind: __af.ref && __af.ref.kind, centre: __t.refPixel(640, 360) })');
-  const green = px => px && px[1] > px[0] + 50 && px[1] > px[2] + 30;
-  check('picture reference: fits, exports underneath, saved inside the project',
-    pic.kind === 'image' && pic.w === 1280 && pic.frames === 5 && green(pic.centre) && pic.side[3] === 0 && green(exported) && reopened.kind === 'image' && green(reopened.centre),
-    { pic, exported, reopened });
-
-  await js(`__af.open(${JSON.stringify(project)})`);
-
-  // ---------- 10. own reference: a drawing of its own under every frame ----------
-  // Tab switches the brush to it; a calligraphic wave drawn there must not touch any frame, must show under the
-  // other frames, hide with Shift+R, undo like a stroke, copy to and from frames, export only when asked and
-  // travel in the project file.
-  await wait(300);
-  await measure();
-  await key('Home');
-  const inksBefore = await js('__af.doc.frames.map((f, i) => __t.ink(i))');
-  await key('Tab');
-  const mode = await js(`({ edit: __af.editSketch, badge: getComputedStyle(document.getElementById('modeBadge')).display !== 'none',
-    button: document.querySelector('#target [data-target=sketch]').classList.contains('on') })`);
-  await key('F');
-  await key('1');
-  await js('__af.setSize(28); true');
-  await mouse(Array.from({ length: 70 }, (_, k) => at(0.08 + (0.84 * k) / 69, 0.12 + 0.05 * Math.sin(k / 5))));
-  const drawnSketch = await js('__t.sketchInk()');
-  const inksAfter = await js('__af.doc.frames.map((f, i) => __t.ink(i))');
-  await shot('sketch.png');
-  await key('Tab');
-  const backToFrames = !(await js('__af.editSketch'));
-  await key('Right');
-  await key('Right');
-  const spot = await js('__t.sketchSpot()');
-  const sceneShown = spot && (await js(`__t.scenePixel(${spot[0]}, ${spot[1]})`));
-  await key('R', ['shift']);
-  const sceneHidden = spot && (await js(`__t.scenePixel(${spot[0]}, ${spot[1]})`));
-  await key('R', ['shift']);
-  await key('Z', ['control']);
-  const sketchUndone = await js('__t.sketchInk()');
-  await key('Y', ['control']);
-  const sketchRedone = await js('__t.sketchInk()');
-  check('own reference: drawn on its own layer, under every frame',
-    mode.edit && mode.badge && mode.button && backToFrames && drawnSketch > 3000 && JSON.stringify(inksAfter) === JSON.stringify(inksBefore) &&
-      !!spot && Math.max(...sceneShown.slice(0, 3)) < 200 && sceneHidden.slice(0, 3).every(v => v === 255) && sketchUndone === 0 && sketchRedone === drawnSketch,
-    { mode, backToFrames, drawnSketch, inksBefore, inksAfter, spot, sceneShown, sceneHidden, sketchUndone, sketchRedone });
-
-  // Frame 1's ball goes into the own reference; then the reference goes into the last frame, under its drawing.
-  await key('Home');
-  await js("document.getElementById('frameToSketch').click(); true");
-  const intoRef = await js("__t.covered(__af.readFrame(0), __af.readLayer('sketch'))");
-  await key('End');
-  const inkLast = await js('__t.ink(__af.cur)');
-  await js("document.getElementById('sketchToFrame').click(); true");
-  const intoFrame = await js("({ ink: __t.ink(__af.cur), covered: __t.covered(__af.readLayer('sketch'), __af.readFrame(__af.cur)) })");
-  await key('Z', ['control']);
-  const restored = await js('__t.ink(__af.cur)');
-  check('own reference: frame to reference and back', intoRef > 0.99 && intoFrame.ink > inkLast && intoFrame.covered > 0.99 && restored === inkLast,
-    { intoRef, inkLast, intoFrame, restored });
-
-  // Exports leave it out unless asked; the project file keeps it with its opacity.
-  const noSketch = path.join(out, 'png-no-sketch');
-  const withSketch = path.join(out, 'png-sketch');
-  await js(`__af.exportTo({ kind: 'png', target: ${JSON.stringify(noSketch)}, name: 'a', scale: 1, withRef: false })`);
-  await js(`__af.exportTo({ kind: 'png', target: ${JSON.stringify(withSketch)}, name: 'a', scale: 1, withRef: false, withSketch: true })`);
-  const firstPixel = dir => js(`(async () => {
-    const bmp = await createImageBitmap(new Blob([await af.read(${JSON.stringify(path.join(dir, 'a_0001.png'))})]));
-    return __t.pixel(bmp, ${spot ? spot.join(', ') : '0, 0'});
-  })()`);
-  const pxNo = await firstPixel(noSketch);
-  const pxYes = await firstPixel(withSketch);
-  await js("(() => { const r = document.getElementById('sketchOpacity'); r.value = 35; r.dispatchEvent(new Event('input', { bubbles: true })); return true; })()");
-  const sketchSaved = await js('__t.sketchInk()');
-  const ownFile = path.join(out, 'own-reference.artframes');
-  await js(`__af.save(${JSON.stringify(ownFile)})`);
-  await js(`__af.open(${JSON.stringify(project)})`);
-  const plain = await js('__af.sketch');
-  await js(`__af.open(${JSON.stringify(ownFile)})`);
-  const reopenedSketch = await js('({ ...__af.sketch, ink: __t.sketchInk(), edit: __af.editSketch })');
-  check('own reference: exported only when asked, saved in the project',
-    pxNo.slice(0, 3).every(v => v === 255) && Math.max(...pxYes.slice(0, 3)) < 80 && !plain.drawn &&
-      reopenedSketch.drawn && reopenedSketch.ink === sketchSaved && Math.abs(reopenedSketch.opacity - 0.35) < 1e-6 && reopenedSketch.visible && !reopenedSketch.edit,
-    { pxNo, pxYes, plain, sketchSaved, reopened: reopenedSketch });
-  await js(`__af.open(${JSON.stringify(project)})`);
-
-  // ---------- 11. the pen's cursor never gets lost ----------
-  // The stage hides the system cursor and draws its own ring. Whatever the pen and the tablet driver do, the ring must
-  // be back under the pen as soon as it hovers over the sheet: after a stroke, after leaving the hover range, when
-  // another pointer (the driver's mouse) leaves the stage, after a stroke released outside, across Tab. And a faded
-  // toast must not keep catching the pen.
-  await wait(200);
-  await measure();
-  const penAt = ([x, y], buttons = 0, type = 'mouseMoved') =>
-    cdp('Input.dispatchMouseEvent', { type, x, y, button: type === 'mouseMoved' && !buttons ? 'none' : 'left', buttons, clickCount: 1, pointerType: 'pen', force: buttons ? 0.6 : 0 });
-  const mouseAt = ([x, y]) => cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', buttons: 0, pointerType: 'mouse' });
-  const hover = async pts => {
-    for (const p of pts) {
-      await penAt(p);
-      await wait(12);
+    // ---------- 3. object tool: outline the square at frame 10, track ----------
+    await key('Escape'); // nothing selected, so O is the Object tool
+    await key('O');
+    const tool3 = await tool();
+    await key('Home');
+    await key('Right', ['shift']);
+    await settle();
+    const cur3 = await js('__ar.cur');
+    const c10 = centre(10);
+    await drag(at(c10[0] - 36, c10[1] - 36), at(c10[0] + 36, c10[1] + 36));
+    await typeText(TEXT_OBJ); // typing while it tracks
+    await shot('04-tracking.png');
+    await key('Enter');
+    const t0 = Date.now();
+    await js('__ar.waitIdle()');
+    report.trackSeconds = (Date.now() - t0) / 1000;
+    report.trackEngine = await js("import('./src/track.js').then(m => m.trackingEngine ? m.trackingEngine() : null)");
+    ns = await notes();
+    const obj = ns[1] || {};
+    const tr = obj.track;
+    let good = 0;
+    let pinGood = 0;
+    const errs = [];
+    if (tr && obj.box) {
+      const k0 = obj.box;
+      const off = [(obj.pin.x - k0.x - k0.w / 2) * W, (obj.pin.y - k0.y - k0.h / 2) * H]; // pin from the box centre, at the key
+      const pins = await js(`import('./src/notes.js').then(m => Array.from({ length: ${N} }, (_, f) => m.placeAt(__ar.review.notes[1], f, { ignoreRange: true }).pin))`);
+      for (let f = 0; f < N; f++) {
+        const b = tr.boxes[f - tr.from];
+        const [cx, cy] = centre(f);
+        if (!b) {
+          errs.push(Infinity);
+          continue;
+        }
+        const e = Math.hypot((b[0] + b[2] / 2) * W - cx, (b[1] + b[3] / 2) * H - cy);
+        errs.push(e);
+        if (e <= 4) good++;
+        // the pin as drawn (notes.js placeAt) must ride with the true square
+        if (Math.hypot(pins[f].x * W - (cx + off[0]), pins[f].y * H - (cy + off[1])) <= 4) pinGood++;
+      }
     }
-    await wait(60);
-  };
-  const under = async p => {
-    const c = await js('__t.cursor()');
-    return { shown: c.shown, off: +Math.hypot(c.x - p[0], c.y - p[1]).toFixed(1) };
-  };
-  const side = await js("(() => { const r = document.getElementById('side').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()");
-  const P = at(0.5, 0.5);
-  const Q = at(0.62, 0.42);
-  const pointer = {};
-  await key('B');
-  await hover(line(at(0.3, 0.5), P, 8));
-  pointer.hover = await under(P);
-  await pen(line(P, at(0.56, 0.62), 12).map(p => [...p, 0.6]));
-  await hover(line(at(0.56, 0.62), Q, 6));
-  pointer.afterStroke = await under(Q);
-  await penAt([-30, Q[1]]); // out of the window: like lifting the pen out of hover range
-  await wait(100);
-  pointer.awayHidden = !(await js('__t.cursor()')).shown;
-  await hover(line(at(0.03, 0.42), Q, 8));
-  pointer.backInRange = await under(Q);
-  await mouseAt(at(0.4, 0.4)); // the driver's mouse is over the stage too...
-  await wait(40);
-  await hover([P]);
-  await mouseAt(side); // ...and leaves it while the pen stays
-  await wait(80);
-  await hover(line(P, Q, 6));
-  pointer.otherPointerLeft = await under(Q);
-  await pen(line(Q, side, 14).map(p => [...p, 0.6])); // a stroke that ends over the side panel
-  await hover(line(at(0.97, 0.45), P, 8));
-  pointer.releasedOutside = await under(P);
-  await key('Tab');
-  await hover(line(P, Q, 4));
-  pointer.ownReference = await under(Q);
-  await key('Tab');
-  await hover(line(Q, P, 4));
-  pointer.backToFrames = await under(P);
-  // A clickable toast ("show in folder") fades out; the place where it was must belong to the stage again.
-  await js(`__af.exportTo({ kind: 'gif', target: ${JSON.stringify(path.join(out, 'toast.gif'))}, name: 'toast', scale: 0.25, withRef: false })`);
-  const toastSpot = await js(`(async () => {
-    const t = document.getElementById('toast');
-    const r = t.getBoundingClientRect();
-    const spot = [r.x + r.width / 2, r.y + r.height / 2];
-    for (let k = 0; k < 80 && t.classList.contains('show'); k++) await new Promise(res => setTimeout(res, 100));
-    return { spot, faded: !t.classList.contains('show') };
-  })()`);
-  await hover([toastSpot.spot]);
-  pointer.whereToastWas = { ...(await under(toastSpot.spot)), faded: toastSpot.faded };
-  const okSeen = v => v.shown && v.off < 3;
-  check('pen cursor stays visible',
-    ['hover', 'afterStroke', 'backInRange', 'otherPointerLeft', 'releasedOutside', 'ownReference', 'backToFrames', 'whereToastWas'].every(k => okSeen(pointer[k])) &&
-      pointer.awayHidden && pointer.whereToastWas.faded,
-    pointer);
-  await js(`__af.open(${JSON.stringify(project)})`);
+    const sorted = [...errs].sort((a, b) => a - b);
+    const trackDetail = {
+      tool: tool3, frame: cur3, text: obj.text, from: tr?.from, to: tr?.to, within4px: good, pinWithin4px: pinGood, frames: N,
+      medianPx: sorted.length ? +sorted[sorted.length >> 1].toFixed(2) : null, maxPx: sorted.length ? +sorted[sorted.length - 1].toFixed(2) : null,
+      lost: errs.filter(e => e === Infinity).length, seconds: report.trackSeconds, engine: report.trackEngine,
+    };
+    report.tracking = trackDetail;
+    check('3. object tool: a box drawn at frame 10 makes a followed note', tool3 === 'object' && cur3 === 10 && ns.length === 2 && obj.text === TEXT_OBJ &&
+      obj.key === 10 && obj.in === 10 && obj.box && obj.color === PALETTE[1] && Math.abs((obj.box.x + obj.box.w / 2) * W - c10[0]) < 2 &&
+      Math.abs((obj.box.y + obj.box.h / 2) * H - c10[1]) < 2, { ...trackDetail, box: obj.box, color: obj.color });
+    check('3. tracking covers the whole shot', tr && tr.from === 0 && tr.to === N - 1 && tr.boxes.length === N, trackDetail);
+    check('3. tracked centre within 4 px of the true square on >= 95% of frames', good >= 0.95 * N, trackDetail);
+    check('3. the pin moves with the object', pinGood >= 0.95 * N, trackDetail);
+    const trackText = await js(`document.querySelector('.card[data-id="${obj.id}"] .track')?.textContent || ''`);
+    check('3. notes panel shows the tracking status', /стежить/.test(trackText), trackText);
 
-  // Donate window from donate.json.
-  await js('af.openDonate(); true');
-  let donateWin = null;
-  for (let k = 0; k < 60 && !donateWin; k++) {
-    await wait(100);
-    donateWin = BrowserWindow.getAllWindows().find(w => w !== win && w.isVisible());
-  }
-  if (donateWin) {
+    // The live preview draws the pin where the square is now (screen pixels, far from the key frame).
+    const truthPin = f => {
+      const [cx, cy] = centre(f);
+      return [cx + (obj.pin.x - obj.box.x - obj.box.w / 2) * W, cy + (obj.pin.y - obj.box.y - obj.box.h / 2) * H];
+    };
+    await js('__ar.seek(37)');
+    await settle();
+    rect = await js('__ar.stageRect()');
+    const rScreen = Math.max(9, (13 * Math.max(rect.width, rect.height)) / 1000);
+    const scr = await screenPixels(ring(...at(...truthPin(37)), rScreen * 0.72));
+    const scrHits = scr.filter(p => near(p, hexRGB(obj.color), 45)).length;
+    check('3. preview draws the followed pin on the square (screen pixels)', scrHits >= 10, { hits: scrHits, of: scr.length, pixels: scr });
+    await shot('05-tracked.png');
+
+    // ---------- 4. I / O keys, undo / redo ----------
+    const cardAt = await js(`(() => { const r = document.querySelector('.card[data-id="${obj.id}"] .range').getBoundingClientRect(); return [r.x + r.width / 2, r.y + r.height / 2]; })()`);
+    await click(...cardAt);
+    const sel = (await js('__ar.selectedId')) === obj.id;
+    const jumped = await js('__ar.cur');
+    await key('Right', ['shift'], 4); // 10 -> 50
+    await key('O');
+    await key('Left', ['shift'], 2);
+    await key('Left', [], 5); // -> 25
+    await key('I');
+    ns = await notes();
+    const edited = { in: ns[1].in, out: ns[1].out };
+    await key('Z', ['control']);
+    await key('Z', ['control']);
+    ns = await notes();
+    const undone = { in: ns[1].in, out: ns[1].out, tracked: !!ns[1].track, notes: ns.length };
+    await key('Z', ['control', 'shift']);
+    await key('Y', ['control']);
+    ns = await notes();
+    const redone = { in: ns[1].in, out: ns[1].out, tracked: !!ns[1].track };
+    const toolAfter = await tool();
+    check('4. I / O set in and out of the selected note', sel && jumped === 10 && edited.in === 25 && edited.out === 50 && toolAfter === 'object', { selected: sel, jumped, edited, tool: toolAfter });
+    check('4. undo restores in / out, redo applies them again (tracking kept)', undone.in === 10 && undone.out === 81 && undone.tracked && undone.notes === 2 &&
+      redone.in === 25 && redone.out === 50 && redone.tracked, { undone, redone });
+    await settle();
+    await shot('06-inout.png');
+
+    // Select tool: drag pin 1 to a new place, undo puts it back.
+    await key('V');
+    const toolV = await tool();
+    await drag(at(100, 310), at(160, 290));
+    const movedPin = (await notes())[0].pin;
+    await key('Z', ['control']);
+    const backPin = (await notes())[0].pin;
+    check('select tool: dragging a pin moves it, undo puts it back', toolV === 'select' && Math.abs(movedPin.x * W - 160) < 1.5 && Math.abs(movedPin.y * H - 290) < 1.5 &&
+      Math.abs(backPin.x * W - 100) < 1.5 && Math.abs(backPin.y * H - 310) < 1.5, { tool: toolV, moved: [movedPin.x * W, movedPin.y * H], back: [backPin.x * W, backPin.y * H] });
+
+    // Transport: Space plays at the shot's rate and stops again.
+    await key('Home');
+    await settle();
+    const playT0 = Date.now();
+    await key('Space');
+    await wait(1000);
+    await key('Space');
+    const playedFor = (Date.now() - playT0) / 1000;
+    const stoppedAt = await js('__ar.cur');
     await wait(300);
-    fs.writeFileSync(path.join(out, 'donate.png'), (await donateWin.webContents.capturePage()).toPNG());
-    const coins = await donateWin.webContents.executeJavaScript("document.querySelectorAll('.coin').length");
-    check('donate window', coins >= 1, { coins, size: donateWin.getContentSize() });
-    donateWin.destroy();
-  } else {
-    check('donate window', false, 'did not open');
+    const stillAt = await js('__ar.cur');
+    check('playback: Space plays about 24 frames a second and stops', stoppedAt >= 0.6 * FPS * playedFor && stoppedAt <= 1.25 * FPS * playedFor && stillAt === stoppedAt,
+      { seconds: playedFor, frames: stoppedAt, after: stillAt });
+    await js('__ar.seek(25)');
+    await settle();
+
+    // ---------- 5 + 6. export through the copy button path, then the clipboard ----------
+    const isWin = process.platform === 'win32';
+    if (isWin) clip = await saveClipboard();
+    await js('window.__exp = __ar.exportNow(); true');
+    await wait(150);
+    const busyShown = await js("!document.getElementById('busy').hidden");
+    await shot('07-exporting.png');
+    const res = await js('window.__exp');
+    const exp = res?.export || null;
+    report.export = exp && { ...exp, text: undefined };
+    const sees = isWin ? await readWinClipboard() : null;
+    // A second copy with nothing changed must reuse the file, not encode again.
+    const t1 = Date.now();
+    const res2 = await js('__ar.exportNow()');
+    const reuseMs = Date.now() - t1;
+    if (isWin) {
+      report.clipboardRestored = await restoreClipboard(clip);
+      clip = null;
+    }
+    await wait(200);
+    await shot('08-copied.png');
+
+    const exists = !!exp?.file && fs.existsSync(exp.file);
+    check('5. export: the MP4 is written to the output folder, with progress shown', exists && path.dirname(exp.file) === path.join(out, 'ArtReview') &&
+      /^shot_010_notes_\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d\.mp4$/.test(path.basename(exp.file)) && busyShown, { file: exp?.file, busyShown });
+    const pinPt = truthPin(37);
+    const pts = ring(...pinPt, Math.max(9, 13 * 0.64) * 0.72);
+    const probe = exists ? await js(PROBE(exp.file, shotFile, 37, pts)) : null;
+    report.probe = probe && { ...probe, exported: undefined, source: undefined };
+    check('5. export decodes: 640x360, 5 s + 3 s end card (+-1 frame), with audio', !!probe && probe.width === W && probe.height === H &&
+      Math.abs(probe.duration - 8) <= 1 / FPS + 1e-3 && Math.abs(probe.frames - (N + 3 * FPS)) <= 1 && !!probe.audio && exp.audio === true &&
+      Math.abs(probe.audioDuration - 5) < 0.1 && exp.width === W && exp.height === H, report.probe);
+    const col = hexRGB(obj.color);
+    const outHits = probe ? probe.exported.filter(p => near(p, col, 50)).length : 0;
+    const srcHits = probe ? probe.source.filter(p => near(p, col, 50)).length : 0;
+    check('5. export frame 37 has the note colour at the tracked pin position (and the source does not)', outHits >= 10 && srcHits <= 2,
+      { outHits, srcHits, of: pts.length, at: pinPt.map(Math.round), exported: probe?.exported });
+    if (probe) {
+      const shots = await js('window.__shots');
+      saveDataURL('09-export-frame.png', shots.frame);
+      saveDataURL('10-endcard.png', shots.card);
+    }
+    const md = exp?.mdFile && fs.existsSync(exp.mdFile) ? fs.readFileSync(exp.mdFile, 'utf8') : '';
+    check('5. the .md beside the video lists both notes with timecodes', !!exp && md.includes(TEXT_PIN) && md.includes(TEXT_OBJ) && md.includes('00:00:00:05') &&
+      md.includes('00:00:01:01') && md.includes('# shot_010.mp4') && md.includes(path.basename(exp.file)) && md.includes("стежить за об'єктом") &&
+      exp.mdFile === exp.file.replace(/\.mp4$/, '.md'), md);
+    check('5. copying again with no changes reuses the export', !!exp && res2?.export?.file === exp.file && reuseMs < 1500, { again: res2?.export?.file, ms: reuseMs });
+
+    const want = `shot_010.mp4 — 2 нотатки\n1. 00:00:00:05 (кадр 6–77) — ${TEXT_PIN}\n2. 00:00:01:01 (кадр 26–51) — ${TEXT_OBJ}`;
+    if (isWin) {
+      const text = (sees?.text || '').replace(/\r\n/g, '\n');
+      check('6. clipboard holds the MP4 as a file (Get-Clipboard -Format FileDropList)', !!exp && res?.copy?.ok && sees?.files?.length === 1 &&
+        path.resolve(sees.files[0]) === path.resolve(exp.file), { copy: res?.copy, files: sees?.files, error: sees?.error });
+      check('6. clipboard text (Get-Clipboard) has the note texts', res?.copy?.withText && text.trim() === want, { text, want });
+      check("6. the user's clipboard text is restored", report.clipboardRestored === true);
+    } else {
+      check('6. clipboard (Windows only): skipped on this platform', true, process.platform);
+    }
+    const lc = await js('__ar.lastClipboard');
+    check('6. the app reports what it put on the clipboard', !!exp && lc?.ok && lc.file === exp.file && (lc.text || '').trim() === (isWin ? want : (lc.text || '').trim()), lc);
+    const statusText = await js("document.getElementById('statusText').textContent");
+    const chipText = await js("document.getElementById('chip').hidden ? '' : document.getElementById('chip').textContent");
+    check('5. status line and the drag chip say what was copied', /^Скопійовано/.test(statusText) && chipText.includes(path.basename(exp?.file || '?')), { status: statusText, chip: chipText });
+
+    // ---------- 7. save / open .artreview, autosave restore ----------
+    const reviewFile = path.join(out, 'notes.artreview');
+    await js(`__ar.saveTo(${JSON.stringify(reviewFile)})`);
+    const before = JSON.stringify(await notes());
+    const savedJSON = fs.existsSync(reviewFile) ? JSON.parse(fs.readFileSync(reviewFile, 'utf8')) : null;
+    await js('__ar.clearNotes()');
+    const cleared = (await notes()).length;
+    await js(`__ar.open(${JSON.stringify(reviewFile)}).then(() => true)`);
+    await wait(300);
+    const reopened = JSON.stringify(await notes());
+    check('7. notes saved to .artreview, cleared and opened again are identical', savedJSON?.format === 'artreview' && savedJSON.version === 1 &&
+      savedJSON.video?.name === 'shot_010.mp4' && savedJSON.video.frameCount === N && cleared === 0 && reopened === before,
+    { cleared, same: reopened === before, video: savedJSON?.video });
+
+    await js('__ar.flushAutosave()');
+    const otherFile = path.join(out, 'other_shot.mp4');
+    await js(MAKE_VIDEO(otherFile, 24, false));
+    await js(`__ar.open(${JSON.stringify(otherFile)}).then(() => true)`);
+    await settle();
+    const other = { notes: (await notes()).length, frames: await js('__ar.video.frameCount'), title: win.getTitle() };
+    await js(`__ar.open(${JSON.stringify(shotFile)}).then(() => true)`);
+    await wait(250);
+    const restored = JSON.stringify(await notes());
+    const toastText = await js("document.getElementById('toast').classList.contains('show') ? document.getElementById('toast').textContent : ''");
+    const reviewsDir = path.join(out, 'reviews');
+    const autosaves = fs.existsSync(reviewsDir) ? fs.readdirSync(reviewsDir).filter(f => f.endsWith('.artreview')) : [];
+    check('7. reopening the video restores the notes silently from the autosave', other.notes === 0 && other.frames === 24 &&
+      other.title === 'ArtReview — other_shot.mp4' && restored === before && toastText === 'Нотатки відновлено' && autosaves.length >= 1,
+    { other, same: restored === before, toast: toastText, autosaves });
+    await settle();
+    await js('__ar.seek(30)');
+    await settle();
+    await shot('11-restored.png');
+
+    // ---------- 8. other main states ----------
+    await js("document.getElementById('settingsBtn').click(); true");
+    await wait(300);
+    check('8. settings popover opens with the defaults', await js(`(() => {
+      const p = document.getElementById('settings');
+      const on = [...p.querySelectorAll('#sizeSeg button.on')].map(b => b.dataset.size);
+      return !p.hidden && on.join() === '1920' && [...p.querySelectorAll('[data-s]')].every(i => i.checked);
+    })()`));
+    await shot('12-settings.png');
+    await key('Escape');
+  } catch (err) {
+    report.fatal = err.stack || String(err);
+    console.error(report.fatal);
+  } finally {
+    if (clip) report.clipboardRestored = await restoreClipboard(clip).catch(() => false);
+    clip = null;
   }
+  clearTimeout(watchdog);
+  if (finished) return;
 
-  // Final picture for the README: the ball with onion skin on its squash frame.
-  await key('Home');
-  await key('Right');
-  await key('Right');
-  await wait(500);
-  await shot('final.png');
-
-  // Dialogs, for a look at the wording.
-  await key('E', ['control']);
-  await wait(400);
-  await shot('export-dialog.png');
-  await key('Escape');
-  await key('F1');
-  await wait(300);
-  await shot('help.png');
-  await key('Escape');
-
-  // ---------- 12. a big brush on a 4K sheet stays smooth ----------
-  await js('__af.setDoc({ width: 3840, height: 2160, fps: 24 })');
-  await wait(300);
-  await measure();
-  for (const [tool, size] of [['round', 160], ['flat', 220]]) {
-    await js(`__af.setTool('${tool}'); __af.setSize(${size}); __af.perf.moves = 0; __af.perf.ms = 0; __af.perf.max = 0;
-      window.__frames = []; window.__stop = false;
-      (function loop(t) { __frames.push(t); if (!__stop) requestAnimationFrame(loop); })(performance.now()); true`);
-    const zigzag = Array.from({ length: 360 }, (_, i) => at(0.05 + 0.9 * (i / 359), 0.5 + 0.35 * Math.sin(i / 9)));
-    await mouse(zigzag);
-    report[`perf4k_${tool}`] = await js(`(() => {
-      __stop = true;
-      const d = __frames.slice(1).map((t, i) => t - __frames[i]).sort((a, b) => a - b);
-      const p = __af.perf;
-      return { frames: d.length, medianMs: +d[d.length >> 1].toFixed(1), p95Ms: +d[Math.floor(d.length * 0.95)].toFixed(1),
-               batches: p.moves, avgBatchMs: +(p.ms / p.moves).toFixed(2), maxBatchMs: +p.max.toFixed(1) };
-    })()`);
-  }
-  const pr = report.perf4k_round;
-  const pf = report.perf4k_flat;
-  check('4K: drawing keeps up with the display', pr.p95Ms < 34 && pf.p95Ms < 34 && pr.avgBatchMs < 4 && pf.avgBatchMs < 4, { round: pr, flat: pf });
-
-  // ---------- demo picture: a bouncing ball drawn with the pen, two ghosts each way ----------
-  await js('__af.setDoc({ width: 1920, height: 1080, fps: 24 }); true');
-  await js("document.querySelectorAll('.stepper button:last-child').forEach(b => b.click()); true"); // two ghosts each way
-  await wait(300);
-  await measure();
-  await key('B');
-  const BALL = [
-    [0.13, 0.2, 0.045, 0.08], [0.21, 0.33, 0.042, 0.088], [0.29, 0.55, 0.039, 0.095], [0.36, 0.765, 0.066, 0.06],
-    [0.43, 0.55, 0.039, 0.095], [0.51, 0.36, 0.043, 0.085], [0.6, 0.27, 0.045, 0.08], [0.69, 0.31, 0.045, 0.08],
-  ];
-  for (let i = 0; i < BALL.length; i++) {
-    if (i) await key('N');
-    await key('2');
-    await js('__af.setSize(4); true');
-    await mouse(line(at(0.04, 0.87), at(0.96, 0.87), 30));
-    await key('1');
-    await js('__af.setSize(10); true');
-    const [fx, fy, rx, ry] = BALL[i];
-    await pen(ring(fx, fy, rx, ry, 64).map(([x, y], k, a) => [x, y, 0.45 + 0.55 * Math.sin((Math.PI * k) / (a.length - 1))]));
-    // a highlight, like on a model sheet
-    await pen(Array.from({ length: 13 }, (_, k) => {
-      const t = Math.PI * (1.08 + (0.32 * k) / 12);
-      return [...at(fx + Math.cos(t) * rx * 0.62, fy + Math.sin(t) * ry * 0.62), 0.3 + 0.4 * Math.sin((Math.PI * k) / 12)];
-    }));
-  }
-  await key('Home');
-  await key('Right');
-  await key('Right');
-  await key('Right');
-  await wait(500);
-  await shot('demo.png');
-
-  // ---------- demo picture: calligraphic loops as the own reference, a ball riding along them ----------
-  await js('__af.setDoc({ width: 1920, height: 1080, fps: 24 }); true');
-  await wait(300);
-  await measure();
-  const loops = u => {
-    const t = u * Math.PI * 6;
-    return [0.12 + 0.76 * u - 0.06 * Math.sin(t), 0.52 - 0.17 * Math.cos(t)];
-  };
-  await key('Tab');
-  await key('F');
-  await key('2');
-  await js('__af.setSize(40); true');
-  await pen(Array.from({ length: 240 }, (_, k) => [...at(...loops(k / 239)), 0.55 + 0.45 * Math.sin((Math.PI * k) / 239)]));
-  await key('Tab');
-  await key('B');
-  await key('1');
-  await js('__af.setSize(9); true');
-  for (let i = 0; i < 8; i++) {
-    if (i) await key('N');
-    const [fx, fy] = loops((i + 0.5) / 8);
-    await pen(ring(fx, fy, 0.024, 0.043, 48).map(([x, y], k, a) => [x, y, 0.45 + 0.55 * Math.sin((Math.PI * k) / (a.length - 1))]));
-  }
-  await key('Home');
-  for (let k = 0; k < 4; k++) await key('Right');
-  await wait(500);
-  await shot('own-reference.png');
-
-  report.errors = report.console.filter(l => /^(error|3):/i.test(l) || /Uncaught|TypeError|ReferenceError/.test(l));
-  check('no errors in the console', !report.errors.length, report.errors);
-  report.failed = Object.entries(report.checks).filter(([, c]) => !c.ok).map(([n]) => n);
-  fs.writeFileSync(path.join(out, 'report.json'), JSON.stringify(report, null, 2));
-  wc.debugger.detach();
-  app.exit(report.failed.length ? 1 : 0);
+  check('no errors in the console', !consoleErrors().length, consoleErrors());
+  if (report.fatal) check('self-test ran to the end', false, report.fatal);
+  const pngs = fs.readdirSync(out).filter(f => f.endsWith('.png'));
+  check('8. screenshots of the main states written', pngs.length >= 12, pngs);
+  finish();
 };
