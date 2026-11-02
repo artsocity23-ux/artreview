@@ -7,10 +7,10 @@
 
 const DEFAULTS = {
   levels: 3, // pyramid levels for LK
-  grid: 10, // grid × grid points inside the box
+  grid: 8, // grid × grid points inside the box; leave time for illumination and similarity checks
   inset: 0.1, // grid inset from the box edge (fraction of the box)
-  half: 7, // LK window half-size (15×15)
-  iters: 20, // LK iterations per level
+  half: 6, // LK window half-size (13×13); pyramid supplies the larger spatial support
+  iters: 12, // bound work on inconsistent/quantised patches; FB and NCC still reject bad solutions
   eps: 0.03, // LK stop when the step is shorter than this (pixels of the level)
   minEig: 0.05, // LK: smallest eigenvalue of the gradient matrix per window pixel; below = flat, untrackable
   nccHalf: 5, // 11×11 patches for the point check
@@ -208,6 +208,7 @@ export class BoxTracker {
       fb: new Float64Array(N), ncc: new Float64Array(N),
       ox: new Float64Array(N), oy: new Float64Array(N), tmp: new Float64Array(Math.max(N, (N * (N - 1)) / 2)),
       pairs: new Float64Array((N * (N - 1)) / 2),
+      angles: new Float64Array((N * (N - 1)) / 2),
     };
     this.rx = 0; // LK result
     this.ry = 0;
@@ -243,7 +244,7 @@ export class BoxTracker {
       const py = y * k;
       // Template and its gradients come from P only, so they are computed once per level (inverse formulation).
       fillWindow(A.data, A.width, A.height, px - h - 1, py - h - 1, m, m, S);
-      let gxx = 0, gxy = 0, gyy = 0;
+      let gxx = 0, gxy = 0, gyy = 0, sumT = 0, sumX = 0, sumY = 0;
       for (let r = 0, t = 0; r < n; r++) {
         let i = (r + 1) * m + 1;
         for (let c = 0; c < n; c++, i++, t++) {
@@ -252,21 +253,29 @@ export class BoxTracker {
           IX[t] = ix;
           IY[t] = iy;
           T[t] = S[i];
+          sumT += S[i];
+          sumX += ix;
+          sumY += iy;
           gxx += ix * ix;
           gxy += ix * iy;
           gyy += iy * iy;
         }
       }
+      // Eliminate the patch's constant brightness offset from the normal equations.
+      gxx -= sumX * sumX / nn;
+      gxy -= sumX * sumY / nn;
+      gyy -= sumY * sumY / nn;
       const det = gxx * gyy - gxy * gxy;
       const minEig = (gxx + gyy - Math.sqrt((gxx - gyy) * (gxx - gyy) + 4 * gxy * gxy)) / (2 * nn);
       if (minEig < o.minEig || det <= 0) return false;
       const iDet = 1 / det;
+      let lastDx = Infinity, lastDy = Infinity;
       for (let it = 0; it < o.iters; it++) {
         const qx = px + vx;
         const qy = py + vy;
         const BW = B.width;
         if (qx < -h || qy < -h || qx > BW - 1 + h || qy > B.height - 1 + h) return false;
-        let bx = 0, by = 0;
+        let bx = 0, by = 0, sumJ = 0;
         const jx = Math.floor(qx - h);
         const jy = Math.floor(qy - h);
         if (jx >= 0 && jy >= 0 && jx + n < BW && jy + n < B.height) {
@@ -286,7 +295,9 @@ export class BoxTracker {
               p++;
               const t1 = d[p];
               const b1 = d[p + BW];
-              const diff = T[t] - (w00 * t0 + w10 * t1 + w01 * b0 + w11 * b1);
+              const value = w00 * t0 + w10 * t1 + w01 * b0 + w11 * b1;
+              sumJ += value;
+              const diff = T[t] - value;
               bx += diff * IX[t];
               by += diff * IY[t];
               t0 = t1;
@@ -296,16 +307,27 @@ export class BoxTracker {
         } else {
           fillWindow(B.data, BW, B.height, qx - h, qy - h, n, n, J);
           for (let t = 0; t < nn; t++) {
+            sumJ += J[t];
             const diff = T[t] - J[t];
             bx += diff * IX[t];
             by += diff * IY[t];
           }
         }
+        bx -= (sumT - sumJ) * sumX / nn;
+        by -= (sumT - sumJ) * sumY / nn;
         const dx = (gyy * bx - gxy * by) * iDet;
         const dy = (gxx * by - gxy * bx) * iDet;
         vx += dx;
         vy += dy;
         if (dx * dx + dy * dy < eps2) break;
+        // Quantised pixels can make inverse LK alternate between two subpixel positions.
+        if ((dx + lastDx) ** 2 + (dy + lastDy) ** 2 < eps2) {
+          vx -= dx / 2;
+          vy -= dy / 2;
+          break;
+        }
+        lastDx = dx;
+        lastDy = dy;
       }
       if (L > 0) {
         vx *= 2;
@@ -380,7 +402,10 @@ export class BoxTracker {
       for (let k = i + 1; k < nk; k++) {
         const d0 = Math.hypot(s.px[k] - s.px[i], s.py[k] - s.py[i]);
         if (d0 < 2) continue;
-        s.pairs[np++] = Math.hypot(s.qx[k] - s.qx[i], s.qy[k] - s.qy[i]) / d0;
+        const ax = s.px[k] - s.px[i], ay = s.py[k] - s.py[i];
+        const bx = s.qx[k] - s.qx[i], by = s.qy[k] - s.qy[i];
+        s.angles[np] = Math.atan2(ax * by - ay * bx, ax * bx + ay * by);
+        s.pairs[np++] = Math.hypot(bx, by) / d0;
       }
     }
     let sc = np ? median(s.pairs, np, s.tmp) : 1;
@@ -389,9 +414,11 @@ export class BoxTracker {
     // a plain median dx is biased whenever the kept points are not symmetric around the centre of a growing box.
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
+    const angle = np ? median(s.angles, np, s.tmp) : 0;
+    const ca = sc * Math.cos(angle), sa = sc * Math.sin(angle);
     for (let i = 0; i < nk; i++) {
-      s.ox[i] = s.qx[i] - sc * (s.px[i] - cx) - cx;
-      s.oy[i] = s.qy[i] - sc * (s.py[i] - cy) - cy;
+      s.ox[i] = s.qx[i] - ca * (s.px[i] - cx) + sa * (s.py[i] - cy) - cx;
+      s.oy[i] = s.qy[i] - sa * (s.px[i] - cx) - ca * (s.py[i] - cy) - cy;
     }
     const dx = median(s.ox, nk, s.tmp);
     const dy = median(s.oy, nk, s.tmp);
@@ -404,6 +431,14 @@ export class BoxTracker {
     if (vis < o.minVisible) return this._lose(Q);
     // Flow only says the points moved consistently. Something textured passing in front moves consistently too,
     // and flow would ride away on it: the box must still look like the object (key or last good template).
+    // A small key-template anchor removes accumulated subpixel bias from codec block boundaries.
+    // Only accept strong, local matches; rotated/occluded content keeps the flow estimate.
+    const anchor = this._match(Q, nb.x + w / 2, nb.y + h / 2, w, h, 4, 4,
+      Math.min(1, 32 / Math.max(w, h)), [this.key]);
+    if (anchor && anchor.score >= 0.9) {
+      nb.x = anchor.x - w / 2;
+      nb.y = anchor.y - h / 2;
+    }
     const look = this._look(Q, nb);
     const app = this._likeness(look);
     if (app < o.minAppearance) return this._lose(Q);
@@ -462,7 +497,7 @@ export class BoxTracker {
 
   // Best NCC position of the templates (key + last good, both resized to w × h) for a centre within ±spanX, ±spanY
   // of (cx, cy), on a grid downscaled by s. Returns { score, x, y } (level-0 pixels) or null.
-  _match(Q, cx, cy, w, h, spanX, spanY, s) {
+  _match(Q, cx, cy, w, h, spanX, spanY, s, templates = this.good === this.key ? [this.key] : [this.key, this.good]) {
     const o = this.o;
     let L = 0;
     while (L < Q.length - 1 && 1 / (1 << (L + 1)) >= s) L++;
@@ -508,7 +543,7 @@ export class BoxTracker {
     const tpl = new Float32Array(nt);
     const map = new Float32Array(nu * nvv);
     let best = -2, bu = 0, bv = 0;
-    for (const src of this.good === this.key ? [this.key] : [this.key, this.good]) {
+    for (const src of templates) {
       const sb = src.box;
       const sl = src.pyr[L];
       const sx = sb.w / tw;

@@ -140,10 +140,11 @@ export class BoxTracker {
 }
 ```
 Algorithm ("median flow" + re-detection):
-1. Points: a 10×10 grid inside the box (inset 10%), tracked prev→next with pyramidal LK (window 15×15, 3 levels,
-   ≤ 20 iterations, epsilon 0.03), then next→prev (forward–backward error) and 11×11 NCC between the patches.
+1. Points: an 8×8 grid inside the box (inset 10%), tracked prev→next with zero-mean pyramidal LK (window 13×13, 3 levels,
+   ≤ 12 iterations, epsilon 0.03), then next→prev (forward–backward error) and 11×11 NCC between the patches.
 2. Keep points with FB error ≤ median FB error and NCC ≥ median NCC; need ≥ 8. Displacement = median dx, dy;
-   scale = median of pairwise distance ratios (clamped 0.8..1.25 per frame).
+   scale = median of pairwise distance ratios (clamped 0.8..1.25 per frame). Median pairwise rotation is removed
+   when voting for the centre. A local key-template NCC anchor (score ≥ 0.9, ±4 px search) limits codec-induced drift.
 3. Lost if fewer than 8 points, median FB error > 8 px (at the gray frame's scale), or the box leaves the frame
    by more than half. On loss: NCC template search (template = the key-frame patch and the last good patch, both
    resized to the current box size, downscaled search) in a window 3× the box around the last good position;
@@ -285,3 +286,44 @@ then reappearance, noise) — centre error ≤ 2 px median, re-acquisition after
 ## Out of scope for v0.1
 Free-hand drawing, arrows, voice notes, comparing two versions, cloud sharing, neural trackers. Keep the code ready
 for "arrow" as a later note kind but do not build UI for it.
+
+## Tracker on degraded footage
+
+Run `node test/tracker.real.test.mjs` (exit 1 on any failure). These are deterministic **synthetic** stress tests,
+not validation on real shots or an H.264 encoder. All pixels are generated in memory; no footage/assets are read.
+Each sequence is 120 frames at 640×360, with a 64 px independently textured square moving about 2.7 px/frame.
+Degradations: nine sub-frame positions averaged over a 1.5-frame shutter; gain ramp 0.65→1.35 plus a sudden
++38 luma exposure step at frame 75; rotation up to 25°; an independently textured moving foreground panel fully
+hiding the object on frames 48–55; or 8×8 block-mean contamination (35%), quantisation in steps of 24 and ±5 noise.
+The combined sequence applies all five effects, including degradation of the initial tracking frame.
+
+Measured on this workstation (Intel64 family 6 model 79, Node v22.23.3), 2026-11-02, with default tracker options.
+Before = original tracker on the same
+generator; after = zero-mean LK, oscillation stop, similarity centre voting, local key anchoring, 8×8 points / 13×13
+LK windows and at most 12 iterations per level. Exported API and existing test thresholds are unchanged.
+
+| Sequence | Before median / p95 px | After median / p95 px | Lost, before → after | Median update ms, before → after |
+| --- | ---: | ---: | ---: | ---: |
+| Motion blur | 0.050 / 0.112 | 0.108 / 0.226 | 0 → 0 | 5.722 → 3.522 |
+| Exposure | 0.184 / 0.273 | 0.065 / 0.211 | 0 → 0 | 5.572 → 5.395 |
+| Rotation | 1.044 / 1.202 | 0.226 / 0.324 | 0 → 0 | 10.205 → 6.641 |
+| Textured occluder | 0.088 / 0.102 | 0.090 / 0.180 | 9 → 9 | 6.002 → 6.448 |
+| Block quantisation | 3.683 / 8.261 | 0.253 / 1.808 | 0 → 0 | 10.474 → 3.815 |
+| Combined | 3.629 / 9.030 | 2.735 / 7.711 | 9 → 9 | 9.909 → 5.019 |
+
+Percentiles use all returned boxes (119 updates), including any returned during occlusion; nulls are reported
+as lost separately. False re-acquisition means a lost→found transition with centre error >64 px: **zero in every
+sequence, before and after**. Both occlusion cases report all eight hidden frames lost and recover on frame 57
+(one visible confirmation frame lost), before and after.
+
+Acceptance limits: median ≤1 px / p95 ≤2 px for each isolated effect; median ≤3 px / p95 ≤8 px combined.
+At most two visible lost frames without occlusion, at most four with occlusion; all eight hidden frames must be
+lost, recovery by frame 60 with error ≤6 px, and zero false re-acquisitions. Every sequence must have median
+update time ≤8 ms (first ten updates excluded for warm-up; generation is not timed). Timing depends on host load.
+The combined p95 remains about 7.7 px: these limits acknowledge accumulated drift under simultaneous rotation
+and block artefacts. They do not imply equivalent performance on arbitrary real footage, longer occlusions,
+fast camera motion or visually identical distractors.
+
+Verification: both Node tracker tests exited 0. The full Electron self-test could not start in the managed
+Windows environment: Electron exited 2147483651 (0x80000003), reporting `install_dir_access.cc:52` / AppContainer
+ACL access to its runtime directory; the ACL repair was denied. No fresh UI/export self-test pass is claimed.
