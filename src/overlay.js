@@ -136,8 +136,13 @@ export function drawOverlay(ctx, W, H, review, f, opts = {}) {
   ctx.textBaseline = 'top';
   ctx.font = `${m.font}px ${FONT_FAMILY}`;
 
+  // The HUD tag is laid out first: bubbles keep clear of it, and it is drawn under the notes, so a pin in the
+  // bottom-left corner shows in the export just as in the preview (which has no HUD).
+  const hud = opts.hud ? hudLayout(ctx, W, H, review, opts, m) : null;
+  ctx.font = `${m.font}px ${FONT_FAMILY}`;
+
   // Bubble sizes and places, in note order so earlier notes keep the best spots.
-  const placed = [];
+  const placed = hud ? [hud] : [];
   const pinRects = items.map(it => ({ x: it.pin.x - m.pinR, y: it.pin.y - m.pinR, w: m.pinR * 2, h: m.pinR * 2 }));
   for (const it of items) {
     const editing = it.id === opts.editingId;
@@ -158,7 +163,9 @@ export function drawOverlay(ctx, W, H, review, f, opts = {}) {
     placed.push(it.bubble);
   }
 
-  // Boxes first: they sit under everything else.
+  if (hud) drawHud(ctx, hud);
+
+  // Boxes next: they sit under the rest of the notes.
   for (const it of items) {
     if (!it.box || !it.note.showBox) continue;
     const b = it.box;
@@ -272,31 +279,35 @@ export function drawOverlay(ctx, W, H, review, f, opts = {}) {
     ctx.setLineDash([]);
   }
 
-  if (opts.hud) drawHud(ctx, W, H, review, opts, m);
   ctx.restore();
 
   return items.map(it => ({ id: it.id, index: it.index, pin: it.pin, r: m.pinR, bubble: it.bubble, box: it.box, lost: it.lost, metrics: m }));
 }
 
-// Bottom-left tag: shot · timecode · frame.
-function drawHud(ctx, W, H, review, opts, m) {
+// Bottom-left tag: shot · timecode · frame. Returns its rect (picture pixels) and what to draw, or null.
+function hudLayout(ctx, W, H, review, opts, m) {
   const name = (review.video?.name || '').replace(/\.[^.]+$/, '');
   let frame = String(opts.frameLabel ?? '');
   if (/^\d/.test(frame)) frame = `кадр ${frame}`;
   const text = [name, opts.timecode, frame].filter(Boolean).join(' · ');
-  if (!text) return;
+  if (!text) return null;
   const size = Math.max(11, 13 * m.u);
   ctx.font = `${size}px ${FONT_FAMILY}`;
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'middle';
   const padX = size * 0.6;
   const h = size * 1.7;
   const w = ctx.measureText(text).width + padX * 2;
-  const x = m.margin;
-  const y = H - m.margin - h;
-  roundRect(ctx, x, y, w, h, size * 0.35);
+  return { x: m.margin, y: H - m.margin - h, w, h, text, size, padX };
+}
+
+function drawHud(ctx, hud) {
+  ctx.save();
+  ctx.font = `${hud.size}px ${FONT_FAMILY}`;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  roundRect(ctx, hud.x, hud.y, hud.w, hud.h, hud.size * 0.35);
   ctx.fillStyle = 'rgba(16, 18, 22, 0.75)';
   ctx.fill();
   ctx.fillStyle = '#e7e9ee';
-  ctx.fillText(text, x + padX, y + h / 2);
+  ctx.fillText(hud.text, hud.x + hud.padX, hud.y + hud.h / 2);
+  ctx.restore();
 }

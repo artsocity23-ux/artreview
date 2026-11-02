@@ -24,7 +24,13 @@ const DEFAULTS = {
   searchSize: 20, // coarse search: template long side in pixels
   refineSize: 48, // fine search: template long side in pixels
   searchSpan: 1.5, // search the centre within ±1.5 box sizes of the last good position (a window 3× the box)
-  reacquire: 0.65, // NCC needed to take the object back
+  reacquire: 0.65, // coarse NCC needed to consider a place at all
+  reacquireFine: 0.8, // NCC at the fine size needed to take the object back
+  ambiguity: 0.1, // the best coarse place must beat the best place elsewhere by this much
+  confirm: 2, // consecutive frames that must agree on the place before the object counts as found again
+  appSize: 24, // appearance check: samples along the box's long side
+  minAppearance: 0.5, // a followed box that looks less like the object than this is not the object (lost)
+  goodAppearance: 0.7, // and the "last good" template is refreshed only from boxes that look at least this alike
   minBox: 4,
 };
 
@@ -180,9 +186,14 @@ export class BoxTracker {
     this.spare = allocPyramid(width, height, o.levels);
     this.box = { x: +box.x, y: +box.y, w: Math.max(o.minBox, +box.w), h: Math.max(o.minBox, +box.h) };
     // Templates for re-detection: the key frame (never drifts) and the last frame we trusted (looks most current).
-    this.key = { pyr: cropPyramid(this.prev, this.box), box: { ...this.box } };
+    // Appearance grid: the box's aspect never changes (scale is uniform), so its shape is fixed at the start.
+    const a = this.box.w / this.box.h;
+    this.aw = Math.max(4, Math.round(a >= 1 ? o.appSize : o.appSize * a));
+    this.ah = Math.max(4, Math.round(a >= 1 ? o.appSize / a : o.appSize));
+    this.key = { pyr: cropPyramid(this.prev, this.box), box: { ...this.box }, look: this._look(this.prev, this.box) };
     this.good = this.key;
     this.lost = false;
+    this.pending = null; // re-detection candidate waiting for confirmation: { x, y, n }
     this.vx = 0; // last centre motion, the LK starting guess (fast objects stay inside the pyramid's reach)
     this.vy = 0;
     const N = o.grid * o.grid;
@@ -391,17 +402,24 @@ export class BoxTracker {
       (Math.max(0, Math.min(nb.x + w, W) - Math.max(nb.x, 0)) * Math.max(0, Math.min(nb.y + h, H) - Math.max(nb.y, 0))) /
       (w * h);
     if (vis < o.minVisible) return this._lose(Q);
+    // Flow only says the points moved consistently. Something textured passing in front moves consistently too,
+    // and flow would ride away on it: the box must still look like the object (key or last good template).
+    const look = this._look(Q, nb);
+    const app = this._likeness(look);
+    if (app < o.minAppearance) return this._lose(Q);
     this.box = nb;
     this.vx = dx;
     this.vy = dy;
     // nv / total: how much of the object could be followed at all (the median filter itself always drops ~3/4).
-    const quality = Math.min(1, Math.max(0, 1 - medFB / o.maxFB)) * (nv / total);
-    if (quality >= o.goodQuality) this.good = { pyr: cropPyramid(Q, nb), box: { ...nb } };
+    const flowQ = Math.min(1, Math.max(0, 1 - medFB / o.maxFB)) * (nv / total);
+    const quality = flowQ * Math.min(1, app / o.goodAppearance);
+    if (flowQ >= o.goodQuality && app >= o.goodAppearance) this.good = { pyr: cropPyramid(Q, nb), box: { ...nb }, look };
     return { box: { ...nb }, quality, lost: false };
   }
 
   _lose(Q) {
     this.lost = true;
+    this.pending = null;
     this.vx = 0;
     this.vy = 0;
     // The object may only have moved too far for LK: look for it right away.
@@ -415,16 +433,28 @@ export class BoxTracker {
     const cx = b.x + b.w / 2;
     const cy = b.y + b.h / 2;
     const s1 = Math.min(1, o.searchSize / Math.max(b.w, b.h));
+    const none = () => {
+      this.pending = null;
+      return { box: null, quality: 0, lost: true };
+    };
     const coarse = this._match(Q, cx, cy, b.w, b.h, o.searchSpan * b.w, o.searchSpan * b.h, s1);
-    if (!coarse || coarse.score < o.reacquire) return { box: null, quality: 0, lost: true };
+    // Smooth content matches a small template almost anywhere: a place counts only if it clearly beats the rest.
+    if (!coarse || coarse.score < o.reacquire || coarse.score - coarse.second < o.ambiguity) return none();
     let best = coarse;
     const s2 = Math.min(1, o.refineSize / Math.max(b.w, b.h));
     if (s2 > s1 * 1.2) {
       const r = 1.5 / s1 + 1;
       const fine = this._match(Q, coarse.x, coarse.y, b.w, b.h, r, r, s2);
-      if (fine) best = fine;
+      if (!fine) return none();
+      best = fine;
     }
-    if (best.score < o.reacquire) return { box: null, quality: 0, lost: true };
+    if (best.score < o.reacquireFine) return none();
+    // One lucky frame is not enough: the place must be found again on the next frame(s), close to the last one.
+    const p = this.pending;
+    const tol = Math.max(4, 0.3 * Math.max(b.w, b.h));
+    this.pending = p && Math.hypot(best.x - p.x, best.y - p.y) <= tol ? { x: best.x, y: best.y, n: p.n + 1 } : { x: best.x, y: best.y, n: 1 };
+    if (this.pending.n < o.confirm) return { box: null, quality: 0, lost: true };
+    this.pending = null;
     this.box = { x: best.x - b.w / 2, y: best.y - b.h / 2, w: b.w, h: b.h };
     this.lost = false;
     return { box: { ...this.box }, quality: Math.min(1, best.score), lost: false };
@@ -522,6 +552,18 @@ export class BoxTracker {
       }
     }
     if (best <= -2) return null;
+    // Best score away from the peak (more than half a template from it): how unique the peak is.
+    const ru = Math.ceil(tw / 2);
+    const rv = Math.ceil(th / 2);
+    let second = -1;
+    for (let v = 0; v < nvv; v++) {
+      const far = Math.abs(v - bv) > rv;
+      for (let u = 0; u < nu; u++) {
+        if (!far && Math.abs(u - bu) <= ru) continue;
+        const sc = map[v * nu + u];
+        if (sc > second) second = sc;
+      }
+    }
     // Sub-cell peak from a parabola through the neighbours.
     const peak = (l, c, r) => {
       const den = l - 2 * c + r;
@@ -532,9 +574,48 @@ export class BoxTracker {
     const oy = bv > 0 && bv < nvv - 1 ? peak(map[mi - nu], map[mi], map[mi + nu]) : 0;
     return {
       score: best,
+      second,
       x: colX(c0 + bu + ox + (tw - 1) / 2),
       y: rowY(r0 + bv + oy + (th - 1) / 2),
     };
+  }
+
+  // The box's picture on the fixed appearance grid, from the pyramid level whose pixels are no finer than the grid
+  // spacing (so the samples are not aliased). Zero mean, unit length; null when the patch is flat.
+  _look(pyr, box) {
+    const n = this.aw * this.ah;
+    const sx = box.w / this.aw;
+    const sy = box.h / this.ah;
+    let L = 0;
+    while (L < pyr.length - 1 && 1 << (L + 1) <= Math.min(sx, sy)) L++;
+    const k = 1 / (1 << L);
+    const out = new Float32Array(n);
+    sampleGrid(pyr[L], (box.x + sx / 2) * k, (box.y + sy / 2) * k, sx * k, sy * k, this.aw, this.ah, out);
+    let mean = 0;
+    for (let i = 0; i < n; i++) mean += out[i];
+    mean /= n;
+    let ss = 0;
+    for (let i = 0; i < n; i++) {
+      out[i] -= mean;
+      ss += out[i] * out[i];
+    }
+    if (ss < n * 1) return null; // flat (an occluder, a blown-out sky): looks like nothing
+    const inv = 1 / Math.sqrt(ss);
+    for (let i = 0; i < n; i++) out[i] *= inv;
+    return out;
+  }
+
+  // NCC of a look with the key and the last good template, whichever is closer.
+  _likeness(look) {
+    if (!look) return 0;
+    let best = -1;
+    for (const t of this.good === this.key ? [this.key] : [this.key, this.good]) {
+      if (!t.look) continue;
+      let d = 0;
+      for (let i = 0; i < look.length; i++) d += look[i] * t.look[i];
+      if (d > best) best = d;
+    }
+    return Math.max(0, best);
   }
 }
 

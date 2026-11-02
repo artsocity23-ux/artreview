@@ -4,7 +4,7 @@
 // redoes, exports through the copy button path, reads the system clipboard back (Windows), saves / reopens the notes
 // and checks the silent autosave restore.
 // Writes report.json plus screenshots into <outdir>; exits 1 if any check fails.
-const { app, clipboard, ClipboardItem } = require('electron');
+const { app, BrowserWindow, clipboard, ClipboardItem } = require('electron');
 const { execFile } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -23,7 +23,7 @@ const CENTRE = 'i => [320 + 200 * Math.sin(i / 120 * Math.PI * 2), 180 + 90 * Ma
 const centre = i => [320 + 200 * Math.sin((i / 120) * Math.PI * 2), 180 + 90 * Math.sin((i / 120) * Math.PI * 4)];
 
 // Files the self-test writes into its folder; only these are removed before a run (the folder may be anyone's).
-const OWN_FILES = /^(report\.json|shot_010\.mp4|other_shot\.mp4|notes\.artreview|\d\d-[a-z-]+\.png)$/;
+const OWN_FILES = /^(report\.json|shot_010\.mp4|other_shot\.mp4|(notes|missing|other_notes)\.artreview|\d\d-[a-z-]+\.png)$/;
 
 const HELPERS = `
 window.__t = {
@@ -300,6 +300,15 @@ module.exports = async function selftest({ win, out }) {
       return getComputedStyle(e).display !== 'none' && !e.hidden && !h.hidden && /Перетягни сюди відео/.test(e.textContent);
     })()`));
 
+    // ---------- 0. notes for a video that is not there, opened before any video ----------
+    const missingFile = path.join(out, 'missing.artreview');
+    fs.writeFileSync(missingFile, JSON.stringify({
+      format: 'artreview', version: 1, video: { name: 'missing_shot.mp4', path: path.join(out, 'nowhere', 'missing_shot.mp4'), size: 1 },
+      notes: [{ id: 'n_missing1', text: 'Нотатка для іншого відео', color: PALETTE[0], in: 0, out: 10, pin: { x: 0.5, y: 0.5 }, key: 0 }],
+    }));
+    await js(`__ar.open(${JSON.stringify(missingFile)}).then(() => true)`);
+    const missingToast = await js("document.getElementById('toast').textContent");
+
     // ---------- 1. open the video ----------
     const shotFile = path.join(out, 'shot_010.mp4');
     report.testVideo = await js(MAKE_VIDEO(shotFile, N, true));
@@ -309,6 +318,8 @@ module.exports = async function selftest({ win, out }) {
     const v = await js('({ frames: __ar.video.frameCount, fps: __ar.video.fps, width: __ar.video.width, height: __ar.video.height, audio: __ar.video.hasAudio, notes: __ar.review.notes.length })');
     check('1. video opens: 120 frames at 24 fps, 640x360, with sound', v.frames === N && Math.abs(v.fps - FPS) < 1e-6 && v.width === W && v.height === H && v.audio && v.notes === 0, v);
     check('1. window title names the shot', win.getTitle() === 'ArtReview — shot_010.mp4', win.getTitle());
+    check('0. notes made for a missing video are not put on another video opened next', v.notes === 0 && /missing_shot\.mp4/.test(missingToast),
+      { notes: v.notes, toast: missingToast });
     check('1. empty state is gone once a video is open', await js("getComputedStyle(document.getElementById('empty')).display === 'none' || document.getElementById('empty').hidden"));
     await shot('02-opened.png');
 
@@ -332,9 +343,11 @@ module.exports = async function selftest({ win, out }) {
     check('2. the note is undoable', (await js('__ar.undoDepth')) === 1, await js('__ar.undoDepth'));
 
     // ---------- 3. object tool: outline the square at frame 10, track ----------
-    await key('Escape'); // nothing selected, so O is the Object tool
-    await key('O');
+    await key('O'); // right after Enter: the Object tool, not "end the note here"
     const tool3 = await tool();
+    const afterO = (await notes())[0] || {};
+    check('2. O right after typing a note switches to the Object tool and leaves the note as it was',
+      tool3 === 'object' && afterO.in === 5 && afterO.out === 5 + 72 - 1 && !(await js('__ar.selectedId')), { tool: tool3, in: afterO.in, out: afterO.out });
     await key('Home');
     await key('Right', ['shift']);
     await settle();
@@ -455,12 +468,17 @@ module.exports = async function selftest({ win, out }) {
     await js('__ar.seek(25)');
     await settle();
 
+    const otherFile = path.join(out, 'other_shot.mp4');
+    await js(MAKE_VIDEO(otherFile, 24, false));
+
     // ---------- 5 + 6. export through the copy button path, then the clipboard ----------
     const isWin = process.platform === 'win32';
     if (isWin) clip = await saveClipboard();
     await js('window.__exp = __ar.exportNow(); true');
     await wait(150);
     const busyShown = await js("!document.getElementById('busy').hidden");
+    // Opening another file while the export runs (a drop, a double-click in Explorer) is refused: the shot stays.
+    const duringOpen = busyShown ? await js(`__ar.open(${JSON.stringify(otherFile)}).then(() => ({ file: __ar.video.file, toast: document.getElementById('toast').textContent }))`) : null;
     await shot('07-exporting.png');
     const res = await js('window.__exp');
     const exp = res?.export || null;
@@ -501,6 +519,8 @@ module.exports = async function selftest({ win, out }) {
     check('5. the .md beside the video lists both notes with timecodes', !!exp && md.includes(TEXT_PIN) && md.includes(TEXT_OBJ) && md.includes('00:00:00:05') &&
       md.includes('00:00:01:01') && md.includes('# shot_010.mp4') && md.includes(path.basename(exp.file)) && md.includes("стежить за об'єктом") &&
       exp.mdFile === exp.file.replace(/\.mp4$/, '.md'), md);
+    check('5. opening another video during the export is refused; the copied text is the exported shot\'s', !!duringOpen &&
+      duringOpen.file === shotFile && /Зачекай/.test(duringOpen.toast) && (res?.export?.text || '').startsWith('shot_010.mp4 — 2 нотатки'), { duringOpen, text: res?.export?.text });
     check('5. copying again with no changes reuses the export', !!exp && res2?.export?.file === exp.file && reuseMs < 1500, { again: res2?.export?.file, ms: reuseMs });
 
     const want = `shot_010.mp4 — 2 нотатки\n1. 00:00:00:05 (кадр 6–77) — ${TEXT_PIN}\n2. 00:00:01:01 (кадр 26–51) — ${TEXT_OBJ}`;
@@ -534,8 +554,6 @@ module.exports = async function selftest({ win, out }) {
     { cleared, same: reopened === before, video: savedJSON?.video });
 
     await js('__ar.flushAutosave()');
-    const otherFile = path.join(out, 'other_shot.mp4');
-    await js(MAKE_VIDEO(otherFile, 24, false));
     await js(`__ar.open(${JSON.stringify(otherFile)}).then(() => true)`);
     await settle();
     const other = { notes: (await notes()).length, frames: await js('__ar.video.frameCount'), title: win.getTitle() };
@@ -552,6 +570,60 @@ module.exports = async function selftest({ win, out }) {
     await js('__ar.seek(30)');
     await settle();
     await shot('11-restored.png');
+
+    // ---------- 7b. notes from a file replace the autosaved ones only undoably; ids from files are sanitised ----------
+    await js(`__ar.open(${JSON.stringify(otherFile)}).then(() => true)`);
+    await settle();
+    const crafted = path.join(out, 'other_notes.artreview');
+    fs.writeFileSync(crafted, JSON.stringify({
+      format: 'artreview', version: 1, video: { name: 'shot_010.mp4', path: shotFile, size: fs.statSync(shotFile).size },
+      notes: [{ id: 'x"><b id="pwn">', text: 'Інша версія нотатки', color: PALETTE[2], in: 0, out: 10, pin: { x: 0.5, y: 0.5 }, key: 0 }],
+    }));
+    await js(`__ar.open(${JSON.stringify(crafted)}).then(() => true)`);
+    await wait(250);
+    const fromFile = await notes();
+    const fileToast = await js("document.getElementById('toast').textContent");
+    const depth = await js('__ar.undoDepth');
+    const injected = await js("!!document.getElementById('pwn')");
+    await key('Z', ['control']);
+    const backToAutosave = JSON.stringify(await notes());
+    check('7. notes from a file replace the autosaved notes undoably (Ctrl+Z brings the autosaved ones back)',
+      (await js('__ar.video.file')) === shotFile && fromFile.length === 1 && fromFile[0].text === 'Інша версія нотатки' && depth === 1 &&
+      /Ctrl\+Z/.test(fileToast) && backToAutosave === before, { notes: fromFile.map(n => n.text), depth, toast: fileToast, back: backToAutosave === before });
+    check('7. a note id from a file cannot inject HTML', /^n_[a-z0-9]+$/.test(fromFile[0]?.id || '') && !injected, { id: fromFile[0]?.id, injected });
+
+    // The HUD tag (export only) is drawn under the notes: a pin in the bottom-left corner still shows.
+    const hudPin = await js(`import('./src/overlay.js').then(m => {
+      const c = document.createElement('canvas'); c.width = 1920; c.height = 1080;
+      const g = c.getContext('2d'); g.fillStyle = '#808080'; g.fillRect(0, 0, 1920, 1080);
+      const review = { video: { name: 'shot_010.mp4' }, notes: [{ id: 'n_hud', text: 'Контакт з підлогою', color: '#3dd6ff', in: 0, out: 10, pin: { x: 0.06, y: 0.97 }, key: 0, box: null, showBox: true, track: null }] };
+      const lay = m.drawOverlay(g, 1920, 1080, review, 0, { hud: true, timecode: '00:00:00:00', frameLabel: '1' });
+      const r = lay[0].r * 0.72, px = 0.06 * 1920, py = 0.97 * 1080;
+      const pts = Array.from({ length: 12 }, (_, k) => [px + Math.cos(k / 12 * 2 * Math.PI) * r, py + Math.sin(k / 12 * 2 * Math.PI) * r]);
+      const pix = __t.pixels(c, pts);
+      const b = lay[0].bubble;
+      return { hits: pix.filter(p => Math.abs(p[0] - 0x3d) < 30 && Math.abs(p[1] - 0xd6) < 30 && Math.abs(p[2] - 0xff) < 30).length, bubbleBottom: b.y + b.h };
+    })`);
+    check('8. the export HUD does not cover a pin in the bottom-left corner', hudPin.hits >= 10, hudPin);
+
+    // The window shows our page only: a navigation started by the page is refused, the bridge still works after it.
+    const appURL = wc.getURL();
+    // (a meta refresh, as an injected tag would do it, to another local page)
+    await js(`document.head.insertAdjacentHTML('beforeend', '<meta http-equiv="refresh" content="0;url=donate.html">'); true`).catch(() => null);
+    await wait(600);
+    check('8. the main window cannot be navigated away from the app', wc.getURL() === appURL && (await js('!!(window.ar && window.__ar && __ar.video)')), wc.getURL());
+    // The donate window still talks to the main process through its own channels (it shows only after donate-ready).
+    await js('ar.openDonate(); true');
+    let donateShown = false;
+    for (let i = 0; i < 40 && !donateShown; i++) {
+      await wait(100);
+      donateShown = BrowserWindow.getAllWindows().some(w => w !== win && w.isVisible());
+    }
+    for (const w of BrowserWindow.getAllWindows()) if (w !== win) w.close();
+    await wait(200);
+    win.focus();
+    wc.focus();
+    check('8. the donate window opens (its channels pass the sender check)', donateShown);
 
     // ---------- 8. other main states ----------
     await js("document.getElementById('settingsBtn').click(); true");

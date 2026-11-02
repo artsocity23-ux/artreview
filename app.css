@@ -402,16 +402,28 @@ main {
 #toast.show { opacity: 1; transform: translate(-50%, 0); }
 #toast.err { background: #5a2420; }
 
-/* ---------- narrow windows: icons only ---------- */
+/* ---------- narrow windows ---------- */
+/* The tool names (Пін / Об'єкт / Вибір) stay down to the minimum window width: the whole flow depends on them.
+   Shortcut hints, the file buttons' words, the chip and the text button give way first. */
 
-@media (max-width: 1500px) {
+#copyTextBtn .short { display: none; }
+
+@media (max-width: 1640px) {
   #copyBtn kbd, #saveBtn span, #loadBtn span { display: none; }
 }
-@media (max-width: 1250px) {
-  #tools button span, #tools kbd, button.labeled span { display: none; }
+@media (max-width: 1320px) {
+  #tools kbd, #saveBtn span, #loadBtn span { display: none; }
+  #chip { max-width: 150px; }
+  #copyTextBtn .full { display: none; }
+  #copyTextBtn .short { display: inline; }
 }
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr 250px; }
   #inout { display: none; }
   .sep { margin: 0 3px; }
+  #bar { gap: 2px; padding: 0 6px; }
+  #chip { max-width: 110px; }
+}
+@media (max-width: 1060px) {
+  #openBtn span { display: none; }
 }

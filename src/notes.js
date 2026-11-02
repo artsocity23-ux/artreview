@@ -5,6 +5,7 @@ export const PALETTE = ['#ff5a4e', '#ffc23d', '#3dd6ff', '#7ee26b', '#ff6bd6', '
 
 export const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
+export const ID_RE = /^n_[a-z0-9]{1,32}$/;
 export const newId = () => `n_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
 // The first palette colour no living note wears, counting on from the newest note's colour, so neighbours differ.
@@ -129,11 +130,13 @@ export function normalizeNote(n, frameCount) {
     track = {
       from: Math.round(num(n.track.from, 0)),
       to: Math.round(num(n.track.to, 0)),
-      boxes: n.track.boxes.map(b => (Array.isArray(b) && b.length >= 4 && b.slice(0, 4).every(Number.isFinite) ? b.slice(0, 5) : null)),
+      boxes: n.track.boxes.map(b => (Array.isArray(b) && b.length >= 4 && b.slice(0, 4).every(Number.isFinite)
+        ? [...b.slice(0, 4), Number.isFinite(b[4]) ? clamp(b[4], 0, 1) : 1] : null)),
     };
   }
   return {
-    id: typeof n.id === 'string' && n.id ? n.id : newId(),
+    // Ids end up in HTML attributes and selectors: only the shape newId() makes is kept.
+    id: typeof n.id === 'string' && ID_RE.test(n.id) ? n.id : newId(),
     text: typeof n.text === 'string' ? n.text : '',
     color: PALETTE.includes(n.color) ? n.color : PALETTE[0],
     in: inF,

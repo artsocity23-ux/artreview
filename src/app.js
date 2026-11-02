@@ -19,6 +19,7 @@ const STAGE_PAD = 16;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const basename = p => String(p).split(/[\\/]/).pop();
 const dirname = p => String(p).replace(/[\\/][^\\/]*$/, '');
+const cardOf = id => document.querySelector(`.card[data-id="${CSS.escape(id)}"]`);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const fmtFps = fps => (Math.abs(fps - Math.round(fps)) < 1e-3 ? String(Math.round(fps)) : fps.toFixed(3).replace(/0+$/, ''));
 
@@ -85,6 +86,26 @@ async function guarded(fn) {
     return null;
   }
 }
+
+// System errors come in English with paths and errno codes; the user gets a short Ukrainian reason, the log the rest.
+const ERRNO_UK = {
+  ENOENT: 'файл або папку не знайдено',
+  EACCES: 'немає доступу до папки чи файлу',
+  EPERM: 'немає доступу до папки чи файлу',
+  EROFS: 'диск лише для читання',
+  ENOSPC: 'на диску немає місця',
+  EBUSY: 'файл зайнятий іншою програмою',
+  EMFILE: 'забагато відкритих файлів',
+};
+function friendly(err) {
+  const msg = String(err?.message || err || '');
+  const code = err?.code || (msg.match(/\b(E[A-Z]{3,})\b/) || [])[1];
+  if (code && ERRNO_UK[code]) return ERRNO_UK[code];
+  if (/[А-Яа-яІіЇїЄєҐґ]/.test(msg)) return msg.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+  return 'невідома помилка (подробиці — у журналі artreview.log)';
+}
+
+const PASTE_KEY = ar.env?.platform === 'darwin' ? 'Cmd+V' : 'Ctrl+V';
 
 const TOOL_HINTS = {
   pin: 'Клікни по відео — з’явиться пін і поле для тексту. Enter — готово, Shift+Enter — новий рядок.',
@@ -195,15 +216,19 @@ function hitTest(p) {
 
 function onStageDown(e) {
   if (e.button !== 0 || !video) return;
+  const p = toPic(e);
   if (editing) {
-    // A click outside the text finishes it; the next click makes the next note.
+    // A click outside the text finishes it and goes on as a normal click (the next pin lands right there);
+    // a click on the note being edited only finishes it.
     e.preventDefault();
+    const id = editing.id;
+    const own = hitTest(p)?.id === id;
     commitEditor();
-    return;
+    if (own) return;
+    render(); // fresh layout without the finished note's editor before hit-testing again
   }
   closeSettings();
   stopPlayback();
-  const p = toPic(e);
   const hit = boxFor ? null : hitTest(p);
   view.setPointerCapture(e.pointerId);
   if (hit) {
@@ -391,7 +416,7 @@ function select(id) {
   renderNotes();
   renderTimeline();
   requestRender();
-  if (id) $(`.card[data-id="${id}"]`)?.scrollIntoView({ block: 'nearest' });
+  if (id) cardOf(id)?.scrollIntoView({ block: 'nearest' });
 }
 
 function setInOut(which) {
@@ -481,13 +506,19 @@ function commitEditor() {
       pushUndo(ed.before);
     }
   }
+  // A finished note lets go of the selection: O right after typing is the Object tool, not "end the note here",
+  // and Delete / Backspace cannot hit the note just typed.
+  if (selectedId === ed.id) selectedId = null;
   setTool(tool);
   changed();
 }
 
 // ---------- undo ----------
 
-const snapshot = () => structuredClone(review?.notes || []);
+// Notes are copied field by field, but a note's track is shared: a track is never changed in place, only replaced
+// (applyTrack, untrack, assignBox), and it holds a box per frame, so deep copies would cost megabytes per snapshot.
+const cloneNote = n => ({ ...n, pin: { ...n.pin }, box: n.box && { ...n.box } });
+const snapshot = () => (review?.notes || []).map(cloneNote);
 
 function pushUndo(before) {
   undoStack.push(before);
@@ -590,10 +621,12 @@ async function pumpTracks() {
     if (tracks.state.get(id) === st) tracks.state.delete(id);
   } catch (err) {
     if (tracks.state.get(id) === st) tracks.state.delete(id);
-    if (err?.name !== 'AbortError') {
+    // Switching the video disposes its decoder, so a cancelled track may end with any error, not only AbortError.
+    const cancelled = err?.name === 'AbortError' || ctrl.signal.aborted || vref !== video;
+    if (!cancelled) {
       tracks.state.set(id, { status: 'failed', progress: 0 });
       ar.log('tracking failed:', err.stack || err.message);
-      toast(`Трекінг не вдався: ${err.message}`, true);
+      toast(`Трекінг не вдався: ${friendly(err)}`, true);
     }
   } finally {
     tracks.running = null;
@@ -644,7 +677,7 @@ function trackHTML(note) {
 
 function updateTrackUI(id) {
   const note = find(id);
-  const el = $(`.card[data-id="${id}"] .track`);
+  const el = cardOf(id)?.querySelector('.track');
   if (note && el) {
     const t = trackStatus(note);
     el.className = `track ${t?.cls || ''}`;
@@ -682,7 +715,7 @@ function renderNotes() {
          <label title="Показувати рамку навколо об'єкта"><input type="checkbox" data-act="showbox" ${n.showBox ? 'checked' : ''}>Рамка</label>
          <button data-act="track" title="Обвести об'єкт заново на поточному кадрі">Обвести заново</button>`
       : `<button data-act="track" title="Обведи об'єкт рамкою — пін поїде за ним">Стежити за об'єктом</button>`;
-    return `<div class="card${n.id === selectedId ? ' sel' : ''}" data-id="${n.id}" style="--c:${n.color}">
+    return `<div class="card${n.id === selectedId ? ' sel' : ''}" data-id="${esc(n.id)}" style="--c:${esc(n.color)}">
       <div class="head"><span class="num">${i + 1}</span><span class="range">${range} · ${timecode(n.in, fps)}</span>
         <button class="x" data-act="del" title="Видалити нотатку (Delete)">×</button></div>
       <div class="text${n.text ? '' : ' empty'}" data-act="edit" title="Клікни, щоб редагувати">${text}</div>
@@ -1000,13 +1033,17 @@ function changed() {
   scheduleAutosave();
 }
 
+const COPY_TITLE = 'Зробити відео з нотатками й покласти в буфер обміну (Ctrl+Shift+C)';
+
 function updateButtons() {
   const has = !!video;
   $('#undoBtn').disabled = !undoStack.length;
   $('#redoBtn').disabled = !redoStack.length;
   $('#saveBtn').disabled = !has;
-  $('#copyBtn').disabled = !has;
-  $('#copyTextBtn').disabled = !has || !review?.notes.length;
+  const any = has && !!review?.notes.length;
+  $('#copyBtn').disabled = !any;
+  $('#copyBtn').title = any ? COPY_TITLE : 'Спершу постав пін: клікни по відео й напиши нотатку';
+  $('#copyTextBtn').disabled = !any;
   $$('#transport button').forEach(b => { b.disabled = !has; });
 }
 
@@ -1041,23 +1078,59 @@ async function autosaveNow() {
 
 // ---------- open / save ----------
 
+// While an export runs, the shot and its notes must stay what is being exported (and the export reads the same file).
+function busyRefusal() {
+  if (!exporting) return false;
+  toast('Зачекай, поки відео готується (або натисни «Скасувати»)', true);
+  return true;
+}
+
 async function openPath(path) {
-  if (!path) return;
+  if (!path || busyRefusal()) return;
   if (REVIEW_EXT.test(path)) return openReviewFile(path);
   return openVideoFile(path);
 }
 
 async function openVideoDialog() {
+  if (busyRefusal()) return;
   const path = await ar.openDialog('video');
   if (path) await guarded(() => openVideoFile(path));
 }
 
+// Notes opened from a file belong to the video they name: same file name, or the same size (a renamed copy).
+const reviewMatches = (rv, v) => !!rv && ((!!rv.name && rv.name === v.name) || (Number.isFinite(rv.size) && rv.size === v.size));
+
+function parseNotes(saved, frameCount) {
+  try {
+    const d = typeof saved === 'string' ? JSON.parse(saved) : saved;
+    return { notes: normalizeNotes(d?.notes, frameCount), startFrame: Number.isInteger(d?.startFrame) ? d.startFrame : null };
+  } catch (err) {
+    ar.log('autosave unreadable:', err.message);
+    return null;
+  }
+}
+
 async function openVideoFile(path, { data = null } = {}) {
+  if (busyRefusal()) return null;
   stopPlayback(false);
   commitEditor();
   await autosaveNow();
   status(`Відкриваю ${basename(path)}…`);
   const v = await openVideo(path);
+  if (exporting) {
+    // An export started while the file was opening: keep the shot it is exporting.
+    v.dispose();
+    busyRefusal();
+    return null;
+  }
+  // The old review is saved under its own key right at the swap: anything that changed while the new file was
+  // opening (a pin, a finished track) is kept, and no timer can later write one video's notes under the other's key.
+  commitEditor();
+  clearTimeout(autosaveTimer);
+  const oldSave = review && reviewKey && (review.notes.length || autosaveExists)
+    ? ar.reviewAutosave(reviewKey, JSON.stringify(serialize())).catch(err => ar.log('autosave failed:', err.message))
+    : null;
+  reviewKey = null;
   abortAllTracks();
   video?.dispose();
   video = v;
@@ -1077,24 +1150,31 @@ async function openVideoFile(path, { data = null } = {}) {
   $('#chip').hidden = true;
   cur = 0;
   frameCanvas = null;
-  reviewKey = await hashKey(path, v.size);
   autosaveExists = false;
-  let restored = false;
-  const incoming = data || pendingReview;
+  await oldSave;
+  const key = await hashKey(path, v.size);
+  let incoming = data;
+  let skipped = null;
+  if (!incoming && pendingReview) {
+    if (reviewMatches(pendingReview.video, v)) incoming = pendingReview;
+    else skipped = pendingReview.video?.name || '?';
+  }
   pendingReview = null;
-  const saved = await ar.reviewAutoload(reviewKey).catch(() => null);
+  const saved = await ar.reviewAutoload(key).catch(() => null);
+  if (video !== v) return v; // another file was opened meanwhile
+  reviewKey = key;
   if (saved) autosaveExists = true;
+  const own = saved ? parseNotes(saved, v.frameCount) : null;
+  if (own) {
+    review.notes = own.notes;
+    if (own.startFrame !== null) review.startFrame = own.startFrame;
+  }
+  let replaced = false;
   if (incoming) {
-    applyReviewData(incoming, false);
-  } else if (saved) {
-    try {
-      const d = typeof saved === 'string' ? JSON.parse(saved) : saved;
-      review.notes = normalizeNotes(d.notes, v.frameCount);
-      if (Number.isInteger(d.startFrame)) review.startFrame = d.startFrame;
-      restored = review.notes.length > 0;
-    } catch (err) {
-      ar.log('autosave unreadable:', err.message);
-    }
+    // Notes from a file replace the autosaved ones, but never silently: the autosaved set stays one Ctrl+Z away.
+    const incomingNotes = normalizeNotes(incoming.notes, v.frameCount);
+    replaced = review.notes.length > 0 && JSON.stringify(incomingNotes) !== JSON.stringify(review.notes);
+    applyReviewData({ ...incoming, notes: incomingNotes }, replaced);
   }
   audio.src = v.hasAudio ? await ar.fileURL(path) : '';
   if (!v.hasAudio) audio.removeAttribute('src');
@@ -1107,8 +1187,10 @@ async function openVideoFile(path, { data = null } = {}) {
   reconcileTracks();
   changed();
   status(`${v.name} · ${v.width}×${v.height} · ${fmtFps(v.fps)} к/с · ${v.frameCount} ${plural(v.frameCount, 'кадр', 'кадри', 'кадрів')}${v.hasAudio ? ' · зі звуком' : ''}`);
-  if (restored) toast('Нотатки відновлено');
+  if (replaced) toast(`Відкрито нотатки з файлу: ${nNotes(review.notes.length)}. Ctrl+Z — повернути автозбережені`);
   else if (incoming) toast(`Відкрито нотатки: ${nNotes(review.notes.length)}`);
+  else if (skipped) toast(`Нотатки з файлу були для «${skipped}» — до цього відео їх не застосовано`, true);
+  else if (own?.notes.length) toast('Нотатки відновлено');
   return v;
 }
 
@@ -1123,7 +1205,12 @@ function applyReviewData(data, undoable) {
   updateInfo();
 }
 
+// A path written inside a notes file is not the user's choice: network (UNC) and device paths are never touched,
+// because just looking at \\host\share makes Windows log in to that host (and hand it the user's NTLM hash).
+const remotePath = p => /^[\\/]{2}/.test(p);
+
 async function openReviewFile(path) {
+  if (busyRefusal()) return;
   const bytes = await ar.read(path);
   let data;
   try {
@@ -1132,23 +1219,27 @@ async function openReviewFile(path) {
     throw new Error('Не вдалося прочитати файл нотаток');
   }
   if (data?.format !== 'artreview' || !Array.isArray(data.notes)) throw new Error('Це не файл нотаток ArtReview');
-  const rv = data.video || {};
-  if (video && (video.file === rv.path || (video.name === rv.name && video.size === rv.size))) {
+  const rv = data.video && typeof data.video === 'object' ? data.video : {};
+  const rvName = typeof rv.name === 'string' ? basename(rv.name) : '';
+  if (video && (video.file === rv.path || (video.name === rvName && video.size === rv.size))) {
     applyReviewData(data, true);
     toast(`Відкрито нотатки: ${nNotes(review.notes.length)}`);
     return;
   }
-  const candidates = [rv.path, rv.name && `${dirname(path)}${path.includes('\\') ? '\\' : '/'}${rv.name}`].filter(Boolean);
+  // The video beside the notes file first (a folder sent as a whole), then the path the notes were made with.
+  const sep = path.includes('\\') ? '\\' : '/';
+  const candidates = [rvName && `${dirname(path)}${sep}${rvName}`, typeof rv.path === 'string' && !remotePath(rv.path) && rv.path]
+    .filter(p => p && VIDEO_EXT.test(p));
   for (const p of candidates) {
     if (await ar.stat(p)) return openVideoFile(p, { data });
   }
   if (video) {
     applyReviewData(data, true);
-    toast(`Відео «${rv.name || '?'}» не знайдено — нотатки накладено на поточне відео`);
+    toast(`Відео «${rvName || '?'}» не знайдено — нотатки накладено на поточне відео (Ctrl+Z — скасувати)`);
     return;
   }
-  pendingReview = data;
-  toast(`Не знайдено відео «${rv.name || '?'}». Відкрий його — нотатки підхопляться.`, true);
+  pendingReview = { ...data, video: { ...rv, name: rvName } };
+  toast(`Не знайдено відео «${rvName || '?'}». Відкрий його — нотатки підхопляться.`, true);
 }
 
 async function openReviewDialog() {
@@ -1174,10 +1265,19 @@ async function saveReview() {
 
 // ---------- export and clipboard ----------
 
+// A track stands in by a number per track object (tracks are replaced, never edited), so the signature stays small.
+const trackIds = new WeakMap();
+let trackSeq = 0;
+const trackId = t => {
+  if (!t) return 0;
+  if (!trackIds.has(t)) trackIds.set(t, ++trackSeq);
+  return trackIds.get(t);
+};
+
 function exportSig() {
   return JSON.stringify({
     path: video.file,
-    notes: review.notes,
+    notes: review.notes.map(n => ({ ...n, track: trackId(n.track) })),
     startFrame: review.startFrame,
     s: [settings.maxSize, settings.endCard, settings.hud, settings.audio, settings.outDir],
   });
@@ -1196,25 +1296,37 @@ async function exportIfNeeded() {
   busyProgress(0, '');
   $('#busy').hidden = false;
   try {
+    // A chosen folder on a drive that is not there now (USB, network): use the default one instead of failing
+    // after the whole encode.
+    let opts = settings;
+    let fellBack = null;
+    if (settings.outDir && !(await ar.stat(settings.outDir))) {
+      fellBack = settings.outDir;
+      opts = { ...settings, outDir: null };
+    }
     if (tracks.running || tracks.queue.length) await waitTracks(ctrl.signal);
     busyProgress(0, '0%');
     const sig = exportSig();
     const t0 = performance.now();
-    const result = await runExport(structuredClone(review), video, settings, {
+    const result = await runExport(structuredClone(review), video, opts, {
       signal: ctrl.signal,
       onProgress: p => busyProgress(p, `${Math.round(p * 100)}%`),
     });
+    // Cancel pressed while the file was being written: the result is not used, whatever made it to disk.
+    if (ctrl.signal.aborted) throw new DOMException('Експорт скасовано', 'AbortError');
     lastExport = { sig, result };
     showChip(result.file);
+    if (fellBack) toast(`Папку «${fellBack}» не знайдено — відео збережено в ${dirname(result.file)}`, true);
     ar.log(`export ${((performance.now() - t0) / 1000).toFixed(1)} s: ${result.file} ${result.width}x${result.height} ${result.codec} audio=${result.audio}`);
     return result;
   } catch (err) {
-    if (err?.name === 'AbortError') {
+    if (err?.name === 'AbortError' || ctrl.signal.aborted) {
       toast('Експорт скасовано');
       status('Експорт скасовано');
       return null;
     }
-    throw new Error(`Не вдалося зробити відео: ${err.message}`);
+    ar.log('export failed:', err?.stack || err?.message);
+    throw new Error(`Не вдалося зробити відео: ${friendly(err)}`);
   } finally {
     exporting = null;
     $('#busy').hidden = true;
@@ -1228,10 +1340,15 @@ async function copyVideo() {
   }
   if (exporting) return null;
   commitEditor();
+  if (!review.notes.length) {
+    toast('Нотаток ще немає: клікни по відео й напиши, що виправити', true);
+    return null;
+  }
   stopPlayback();
   const result = await exportIfNeeded();
   if (!result) return null;
-  const text = notesText(review, settings);
+  // The text of the notes that were exported, not of whatever is open now.
+  const text = result.text;
   const wantText = settings.copyTextWithVideo !== false;
   let res;
   try {
@@ -1243,7 +1360,7 @@ async function copyVideo() {
   lastClipboard = { file: res?.ok ? result.file : null, text: res?.withText ? text : null, ok: !!res?.ok };
   let msg;
   if (res?.ok) {
-    msg = res.withText ? 'Скопійовано: відео + текст. Встав у чат (Ctrl+V)' : 'Скопійовано відео. Встав у чат (Ctrl+V)';
+    msg = res.withText ? `Скопійовано: відео + текст. Встав у чат (${PASTE_KEY})` : `Скопійовано відео. Встав у чат (${PASTE_KEY})`;
     if (wantText && !res.withText) msg += ' · текст — кнопкою «Копіювати текст»';
     status(msg, 'ok');
     toast(msg);
@@ -1262,7 +1379,7 @@ async function copyText() {
   await ar.copyText(text);
   lastClipboard = { file: null, text, ok: true };
   toast('Скопійовано текст нотаток');
-  status('Текст нотаток у буфері. Встав у чат (Ctrl+V)', 'ok');
+  status(`Текст нотаток у буфері. Встав у чат (${PASTE_KEY})`, 'ok');
 }
 
 function showChip(file) {
@@ -1375,7 +1492,7 @@ function wire() {
     if (!note) return;
     note.text = editor.value;
     requestRender();
-    const t = $(`.card[data-id="${note.id}"] .text`);
+    const t = cardOf(note.id)?.querySelector('.text');
     if (t) {
       t.textContent = note.text || 'Без тексту — клікни, щоб написати';
       t.classList.toggle('empty', !note.text);
@@ -1504,7 +1621,13 @@ addEventListener('keydown', e => {
   // O sets the end of the selected note; with nothing selected it is the Object tool.
   else if (k === 'KeyO') (selectedId && find(selectedId) ? setInOut('out') : setTool('object'));
   else if (k === 'Delete' || k === 'Backspace') {
-    if (selectedId) removeNote(selectedId);
+    const n = review?.notes.findIndex(x => x.id === selectedId) ?? -1;
+    if (n >= 0) {
+      removeNote(selectedId);
+      const msg = `Нотатку ${n + 1} видалено · Ctrl+Z — повернути`;
+      status(msg);
+      toast(msg);
+    }
   } else if (k === 'Enter' || k === 'NumpadEnter') {
     if (selectedId) openEditor(selectedId);
   } else if (k === 'Escape') {

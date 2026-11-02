@@ -61,7 +61,10 @@ export async function runExport(review, video, settings, { onProgress, signal } 
     const first = await vtrack.getFirstTimestamp();
     const videoEnd = video.end - first; // output seconds where the picture ends and the end card begins
     const videoSource = new VideoSampleSource({ codec, quality: QUALITY_HIGH, keyFrameInterval: 2 });
-    output.addVideoTrack(videoSource, { frameRate: fps });
+    // No frameRate here: mediabunny would snap every timestamp to a 1/fps grid, and fps is only an estimate, so a
+    // variable-rate phone clip would get frames piled on one timestamp. The default fine timescale keeps the
+    // source's own timestamps.
+    output.addVideoTrack(videoSource);
     const audio = settings.audio !== false ? await prepareAudio(input, output) : null;
     await output.start();
     started = true;
@@ -127,8 +130,10 @@ export async function runExport(review, video, settings, { onProgress, signal } 
     }
     check();
     await output.finalize();
+    check(); // finalizing a long export takes seconds; a cancel pressed meanwhile must not write the file
     const bytes = new Uint8Array(output.target.buffer);
     await ar.write(file, bytes);
+    check();
     const info = { file, width: W, height: H };
     await ar.write(mdFile, new TextEncoder().encode(notesMarkdown(review, settings, info)));
     onProgress?.(1);

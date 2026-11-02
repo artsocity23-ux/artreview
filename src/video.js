@@ -37,12 +37,23 @@ export async function openVideo(file) {
   if (!track) throw new Error('У файлі немає відео');
   if (!(await track.canDecode())) throw new Error(UNSUPPORTED);
   const first = await track.getFirstTimestamp();
-  const end = await track.computeDuration();
-  // A short clip is counted whole (frames / length); a long one is sampled from its first packets.
+  let end = await track.computeDuration();
+  // A long clip is sampled from its first packets. A short one is measured whole from its timestamps: N frames span
+  // N - 1 intervals. Frames / (end - first) would be off by a frame, because WebM files from browsers and recorders
+  // often give the last frame no duration, and then preview and export frames drift apart.
   const stats = await track.computePacketStats(240);
-  const raw = stats.packetCount < 240 && end > first ? stats.packetCount / (end - first) : stats.averagePacketRate || 30;
+  let raw = stats.packetCount < 240 && end > first ? stats.packetCount / (end - first) : stats.averagePacketRate || 30;
+  let whole = 0;
+  if (stats.packetCount < 240 && stats.packetCount >= 3) {
+    const m = await track.computeFrameRateMetrics({ targetPacketCount: Infinity }).catch(() => null);
+    if (m?.averageFrameRate > 0 && Number.isFinite(m.averageFrameRate)) {
+      raw = m.averageFrameRate;
+      whole = stats.packetCount;
+    }
+  }
   const nearest = STANDARD_FPS.reduce((a, b) => (Math.abs(b - raw) < Math.abs(a - raw) ? b : a));
   const fps = Math.abs(nearest - raw) / raw < 0.005 ? nearest : Math.round(raw * 1000) / 1000;
+  if (whole) end = Math.max(end, first + whole / fps); // the last frame counts even when its duration is 0
   const audio = await input.getPrimaryAudioTrack().catch(() => null);
   const hasAudio = !!audio && (await audio.canDecode().catch(() => false));
   // Display size: rotation (phone videos) and pixel aspect already applied, so the picture shows upright.

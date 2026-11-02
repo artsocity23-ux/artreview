@@ -196,6 +196,8 @@ export async function trackNote(video, note, { onProgress, signal } = {}) {
     fwd = await pass(eng, 'f', keyGray, size, box, forwardFrames(), video.fps, signal, step);
     bwd = await pass(eng, 'b', keyGray, size, box, backwardFrames(), video.fps, signal, step);
   } catch (err) {
+    // Once aborted (the video was switched and its decoder disposed), any error is the cancel: no retry.
+    if (signal?.aborted) throw abortError();
     if (err?.name === 'AbortError' || eng.kind !== 'worker' || !eng.broken) throw err;
     // The worker died mid-track: do the whole note again on the main thread.
     fallbackOnly = true;

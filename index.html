@@ -2,7 +2,7 @@
 <html lang="uk">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; img-src 'self' data: blob:; media-src 'self' file: blob:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob: file:">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; img-src 'self' data: blob:; media-src 'self' file: blob:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob: file:; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>ArtReview</title>
 <link rel="stylesheet" href="app.css">
 </head>
@@ -29,7 +29,7 @@
   <button id="settingsBtn" class="ghost" title="Налаштування"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M5.5 18.5l1.7-1.7M16.8 7.2l1.7-1.7"/></svg></button>
   <button id="donateBtn" class="ghost heart" title="Підтримати автора" hidden>♥</button>
   <button id="copyBtn" class="primary" title="Зробити відео з нотатками й покласти в буфер обміну (Ctrl+Shift+C)">Скопіювати відео з нотатками<kbd>Ctrl+Shift+C</kbd></button>
-  <button id="copyTextBtn" class="secondary" title="Покласти в буфер лише текст нотаток">Копіювати текст</button>
+  <button id="copyTextBtn" class="secondary" title="Покласти в буфер лише текст нотаток"><span class="full">Копіювати текст</span><span class="short">Текст</span></button>
   <button id="chip" draggable="true" hidden title="Перетягни в чат · клік — показати в папці"></button>
 </header>
 

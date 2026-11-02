@@ -26,7 +26,7 @@ const donateCrypto = (donate.crypto || []).filter(c => c.address);
 const donateLinks = (donate.links || []).filter(l => /^https:\/\//.test(l.url || ''));
 
 let win = null;
-let pendingFile = SELFTEST ? null : fileFromArgs(process.argv);
+let pendingFile = SELFTEST ? null : fileFromArgs(process.argv, process.cwd());
 let settings = SELFTEST ? { ...DEFAULT_SETTINGS } : cleanSettings(readJSON(SETTINGS_FILE));
 
 function log(...parts) {
@@ -51,8 +51,15 @@ function readJSON(file) {
   }
 }
 
-function fileFromArgs(argv) {
-  return argv.slice(1).find(a => OPENABLE.test(a) && fs.existsSync(a)) || null;
+// Relative arguments belong to the folder the command was typed in (for a second instance, its folder, not ours).
+// The renderer gets an absolute path, so the autosave key of a video does not depend on how it was named.
+function fileFromArgs(argv, cwd) {
+  for (const a of argv.slice(1)) {
+    if (!OPENABLE.test(a)) continue;
+    const file = path.resolve(cwd || process.cwd(), a);
+    if (fs.existsSync(file)) return file;
+  }
+  return null;
 }
 
 function writeAtomic(file, text) {
@@ -89,6 +96,38 @@ function defaultOutDir() {
   return path.join(videos, 'ArtReview');
 }
 
+// ---------- who may talk to the main process ----------
+
+const APP_URL = pathToFileURL(path.join(ROOT, 'index.html')).href;
+const DONATE_URL = pathToFileURL(path.join(ROOT, 'donate.html')).href;
+
+// Only the top frame of our own page may use the bridge. A notes file must never be able to bring in a page or a
+// frame that reaches files through it (navigation is blocked too; this is the second lock).
+function trusted(e, url) {
+  const f = e.senderFrame;
+  return !!f && !f.parent && String(f.url).split('#')[0] === url;
+}
+function handle(channel, fn, url = APP_URL) {
+  ipcMain.handle(channel, (e, ...args) => {
+    if (!trusted(e, url)) throw new Error(`${channel}: not allowed from this page`);
+    return fn(e, ...args);
+  });
+}
+function listen(channel, fn, url = APP_URL) {
+  ipcMain.on(channel, (e, ...args) => {
+    if (trusted(e, url)) fn(e, ...args);
+  });
+}
+
+// Our windows show our own pages only: no navigation (a dropped .html, a link, a meta refresh), no popups, no webviews.
+function lockDown(contents) {
+  contents.on('will-navigate', e => e.preventDefault());
+  contents.on('will-frame-navigate', e => e.preventDefault());
+  contents.on('will-redirect', e => e.preventDefault());
+  contents.on('will-attach-webview', e => e.preventDefault());
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+}
+
 // ---------- window ----------
 
 function createWindow() {
@@ -106,6 +145,7 @@ function createWindow() {
     webPreferences: { preload: path.join(ROOT, 'preload.js'), backgroundThrottling: false, spellcheck: false },
   });
   win.removeMenu();
+  lockDown(win.webContents);
   win.loadFile(path.join(ROOT, 'index.html'));
   win.once('ready-to-show', () => {
     if (!SELFTEST && workArea.width <= 1920) win.maximize();
@@ -121,7 +161,7 @@ function createWindow() {
   // No save prompt on close: the renderer autosaves the notes of every video as it goes.
   win.on('closed', () => {
     win = null;
-    for (const fd of fds.values()) fs.closeSync(fd);
+    for (const entry of fds.values()) closeEntry(entry);
     fds.clear();
   });
 }
@@ -135,7 +175,7 @@ const FILTERS = {
 
 let lastDir = app.getPath('documents');
 
-ipcMain.handle('ar:open-dialog', async (e, kind) => {
+handle('ar:open-dialog', async (e, kind) => {
   const { canceled, filePaths } = await dialog.showOpenDialog(win, {
     title: kind === 'review' ? 'Відкрити нотатки' : 'Відкрити відео',
     defaultPath: lastDir,
@@ -147,7 +187,7 @@ ipcMain.handle('ar:open-dialog', async (e, kind) => {
   return filePaths[0];
 });
 
-ipcMain.handle('ar:save-dialog', async (e, kind, name) => {
+handle('ar:save-dialog', async (e, kind, name) => {
   const { canceled, filePath } = await dialog.showSaveDialog(win, {
     title: 'Зберегти нотатки',
     defaultPath: path.join(lastDir, name || 'notes.artreview'),
@@ -158,7 +198,7 @@ ipcMain.handle('ar:save-dialog', async (e, kind, name) => {
   return filePath;
 });
 
-ipcMain.handle('ar:folder-dialog', async () => {
+handle('ar:folder-dialog', async () => {
   const { canceled, filePaths } = await dialog.showOpenDialog(win, {
     title: 'Папка для відео з нотатками',
     defaultPath: settings.outDir || defaultOutDir(),
@@ -168,39 +208,55 @@ ipcMain.handle('ar:folder-dialog', async () => {
   return filePaths[0];
 });
 
-ipcMain.handle('ar:read', (e, file) => fs.promises.readFile(file));
-ipcMain.handle('ar:write', async (e, file, data) => {
+handle('ar:read', (e, file) => fs.promises.readFile(file));
+handle('ar:write', async (e, file, data) => {
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
   await fs.promises.writeFile(file, data);
   return file;
 });
-ipcMain.handle('ar:stat', (e, file) => fs.promises.stat(file).then(s => ({ size: s.size, mtime: s.mtimeMs }), () => null));
-ipcMain.handle('ar:file-url', (e, file) => pathToFileURL(file).href);
-ipcMain.handle('ar:reveal', (e, file) => shell.showItemInFolder(file));
+handle('ar:stat', (e, file) => fs.promises.stat(file).then(s => ({ size: s.size, mtime: s.mtimeMs }), () => null));
+handle('ar:file-url', (e, file) => pathToFileURL(file).href);
+handle('ar:reveal', (e, file) => shell.showItemInFolder(file));
 
 // Byte ranges for the video decoder, so a long video never has to sit in memory as a whole.
-const fds = new Map();
-ipcMain.handle('ar:range', async (e, file, start, end) => {
-  let fd = fds.get(file);
-  if (fd === undefined) {
-    fd = fs.openSync(file, 'r');
-    fds.set(file, fd);
+// One descriptor per file, shared by every reader of it (the preview and a running export read the same shot).
+// Closing waits for reads still in flight, and a later read opens the file again, so one reader letting go never
+// pulls the descriptor from under another (that read would fail with EBADF).
+const fds = new Map(); // file -> { fd, busy, closing }
+function closeEntry(entry) {
+  entry.closing = true;
+  if (entry.busy === 0 && entry.fd !== null) {
+    fs.close(entry.fd, () => {});
+    entry.fd = null;
   }
-  const buf = Buffer.allocUnsafe(end - start);
-  const { bytesRead } = await new Promise((resolve, reject) =>
-    fs.read(fd, buf, 0, buf.length, start, (err, bytesRead) => (err ? reject(err) : resolve({ bytesRead }))));
-  return bytesRead === buf.length ? buf : buf.subarray(0, bytesRead);
+}
+handle('ar:range', async (e, file, start, end) => {
+  let entry = fds.get(file);
+  if (!entry) {
+    entry = { fd: fs.openSync(file, 'r'), busy: 0, closing: false };
+    fds.set(file, entry);
+  }
+  entry.busy++;
+  try {
+    const buf = Buffer.allocUnsafe(end - start);
+    const { bytesRead } = await new Promise((resolve, reject) =>
+      fs.read(entry.fd, buf, 0, buf.length, start, (err, bytesRead) => (err ? reject(err) : resolve({ bytesRead }))));
+    return bytesRead === buf.length ? buf : buf.subarray(0, bytesRead);
+  } finally {
+    entry.busy--;
+    if (entry.closing) closeEntry(entry);
+  }
 });
-ipcMain.handle('ar:range-close', (e, file) => {
-  const fd = fds.get(file);
-  if (fd !== undefined) fs.closeSync(fd);
+handle('ar:range-close', (e, file) => {
+  const entry = fds.get(file);
   fds.delete(file);
+  if (entry) closeEntry(entry);
 });
 
 // ---------- settings, autosave ----------
 
-ipcMain.handle('ar:settings', () => ({ ...settings }));
-ipcMain.handle('ar:set-settings', (e, patch) => {
+handle('ar:settings', () => ({ ...settings }));
+handle('ar:set-settings', (e, patch) => {
   settings = cleanSettings({ ...settings, ...patch });
   if (!SELFTEST) {
     try {
@@ -211,17 +267,17 @@ ipcMain.handle('ar:set-settings', (e, patch) => {
   }
   return { ...settings };
 });
-ipcMain.handle('ar:default-out-dir', () => defaultOutDir());
+handle('ar:default-out-dir', () => defaultOutDir());
 
 // The key comes from the renderer (a hash of the video path and size); the pattern keeps it a plain file name.
 function reviewFile(key) {
   if (typeof key !== 'string' || !/^[0-9a-f]{8,64}$/.test(key)) throw new Error(`bad review key: ${key}`);
   return path.join(REVIEWS, `${key}.artreview`);
 }
-ipcMain.handle('ar:review-autosave', (e, key, json) => {
+handle('ar:review-autosave', (e, key, json) => {
   writeAtomic(reviewFile(key), typeof json === 'string' ? json : JSON.stringify(json));
 });
-ipcMain.handle('ar:review-autoload', (e, key) => {
+handle('ar:review-autoload', (e, key) => {
   try {
     return fs.readFileSync(reviewFile(key), 'utf8');
   } catch (err) {
@@ -232,15 +288,15 @@ ipcMain.handle('ar:review-autoload', (e, key) => {
 
 // ---------- clipboard, drag-out ----------
 
-ipcMain.handle('ar:copy-video', async (e, file, text) => {
+handle('ar:copy-video', async (e, file, text) => {
   const r = await copyVideo(file, text);
   log(`copy video ${file}: ${r.ok ? (r.withText ? 'file + text' : 'file') : `failed (${r.error})`}`);
   return { ok: r.ok, withText: r.withText };
 });
-ipcMain.handle('ar:copy-text', (e, text) => clipboard.writeText(String(text ?? '')));
+handle('ar:copy-text', (e, text) => clipboard.writeText(String(text ?? '')));
 
 let dragIcon = null;
-ipcMain.on('ar:drag-out', (e, file) => {
+listen('ar:drag-out', (e, file) => {
   if (!file || !fs.existsSync(file)) return;
   // startDrag needs a non-empty icon (macOS throws without one).
   dragIcon ||= nativeImage.createFromPath(path.join(ROOT, 'icon.png')).resize({ width: 48, height: 48 });
@@ -249,16 +305,17 @@ ipcMain.on('ar:drag-out', (e, file) => {
 
 // ---------- misc ----------
 
+// Harmless facts; answered for every page, because a sync message without an answer would hang the page.
 ipcMain.on('ar:env', e => {
   e.returnValue = { selftest: SELFTEST, version: app.getVersion(), platform: process.platform };
 });
-ipcMain.handle('ar:pending-file', () => {
+handle('ar:pending-file', () => {
   const file = pendingFile;
   pendingFile = null;
   return file;
 });
-ipcMain.on('ar:set-title', (e, title) => win?.setTitle(String(title || 'ArtReview')));
-ipcMain.on('ar:log', (e, ...parts) => log(...parts));
+listen('ar:set-title', (e, title) => win?.setTitle(String(title || 'ArtReview')));
+listen('ar:log', (e, ...parts) => log(...parts));
 
 function openFromOS(file) {
   if (!file || !OPENABLE.test(file)) return;
@@ -292,6 +349,7 @@ function openDonate() {
     webPreferences: { preload: path.join(ROOT, 'preload.js') },
   });
   donateWin.removeMenu();
+  lockDown(donateWin.webContents);
   donateWin.loadFile(path.join(ROOT, 'donate.html'));
   return donateWin;
 }
@@ -304,21 +362,21 @@ function qrDataURL(text) {
   return qr.createDataURL(6, 24);
 }
 
-ipcMain.handle('ar:donate-available', () => donateCrypto.length + donateLinks.length > 0);
-ipcMain.on('ar:donate-open-window', () => openDonate());
-ipcMain.handle('ar:donate', () => ({
+handle('ar:donate-available', () => donateCrypto.length + donateLinks.length > 0);
+listen('ar:donate-open-window', () => openDonate());
+handle('ar:donate', () => ({
   crypto: donateCrypto.map(c => ({ name: c.name, network: c.network, address: c.address, qr: qrDataURL(c.address) })),
   links: donateLinks.map(l => l.name),
-}));
-ipcMain.handle('ar:donate-copy', (e, i) => clipboard.writeText(donateCrypto[i]?.address || ''));
-ipcMain.on('ar:donate-open', (e, i) => donateLinks[i] && shell.openExternal(donateLinks[i].url));
-ipcMain.on('ar:donate-ready', (e, height) => {
+}), DONATE_URL);
+handle('ar:donate-copy', (e, i) => clipboard.writeText(donateCrypto[i]?.address || ''), DONATE_URL);
+listen('ar:donate-open', (e, i) => donateLinks[i] && shell.openExternal(donateLinks[i].url), DONATE_URL);
+listen('ar:donate-ready', (e, height) => {
   if (!donateWin || donateWin.isDestroyed() || e.sender !== donateWin.webContents) return;
   const { workArea } = screen.getDisplayMatching(donateWin.getBounds());
   donateWin.setContentSize(480, Math.min(Math.ceil(height), workArea.height - 40));
   donateWin.center();
   donateWin.show();
-});
+}, DONATE_URL);
 
 // ---------- lifecycle ----------
 
@@ -330,8 +388,8 @@ if (process.platform === 'win32') app.setAppUserModelId('io.github.artsocity23ux
 if (!SELFTEST && !app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', (e, argv) => {
-    const file = fileFromArgs(argv);
+  app.on('second-instance', (e, argv, workingDirectory) => {
+    const file = fileFromArgs(argv, workingDirectory);
     if (file) return openFromOS(file);
     if (!win) return;
     if (win.isMinimized()) win.restore();

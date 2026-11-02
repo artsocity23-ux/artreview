@@ -74,8 +74,11 @@ const objTex = valueNoise(29, -SIDE / 2 - 2, -SIDE / 2 - 2, SIDE + 4, SIDE + 4, 
 
 // One frame. st: { cx, cy, s, noise, blocks: [{ x, y, w, h, v }] }. The square is supersampled 3×3 so sub-pixel
 // positions and scales show up as real partial-pixel coverage.
-function render(st, seed) {
-  const f = new Float32Array(background);
+// scene: { background, objTex } (defaults: the textured background and square above).
+function render(st, seed, scene = {}) {
+  const bgImg = scene.background || background;
+  const tex = scene.objTex || objTex;
+  const f = new Float32Array(bgImg);
   const half = (SIDE / 2) * st.s;
   const xa = Math.max(0, Math.floor(st.cx - half - 1));
   const xb = Math.min(W - 1, Math.ceil(st.cx + half + 1));
@@ -89,7 +92,7 @@ function render(st, seed) {
           const u = (x + i / 3 - st.cx) / st.s;
           const v = (y + j / 3 - st.cy) / st.s;
           if (Math.abs(u) < SIDE / 2 && Math.abs(v) < SIDE / 2) {
-            acc += objTex(u, v);
+            acc += tex(u, v);
             cov++;
           }
         }
@@ -99,7 +102,7 @@ function render(st, seed) {
   }
   for (const b of st.blocks || []) {
     for (let y = Math.max(0, Math.floor(b.y)); y < Math.min(H, b.y + b.h); y++) {
-      for (let x = Math.max(0, Math.floor(b.x)); x < Math.min(W, b.x + b.w); x++) f[y * W + x] = b.v;
+      for (let x = Math.max(0, Math.floor(b.x)); x < Math.min(W, b.x + b.w); x++) f[y * W + x] = b.tex ? b.tex(x - b.x, y - b.y) : b.v;
     }
   }
   const r = rng(seed * 7919 + 1);
@@ -121,13 +124,13 @@ const times = [];
 
 // Runs one sequence; frames[i] = state. Returns per-frame results with the error against the truth.
 // loose: the drawn box is this much bigger than the object (people draw boxes with some background in them).
-function run(name, frames, seed, loose = 1) {
+function run(name, frames, seed, loose = 1, scene = {}) {
   const st0 = frames[0];
   const half = (SIDE / 2) * st0.s * loose;
-  const tracker = new BoxTracker(render(st0, seed), W, H, { x: st0.cx - half, y: st0.cy - half, w: 2 * half, h: 2 * half });
+  const tracker = new BoxTracker(render(st0, seed, scene), W, H, { x: st0.cx - half, y: st0.cy - half, w: 2 * half, h: 2 * half });
   const res = [null];
   for (let i = 1; i < frames.length; i++) {
-    const g = render(frames[i], seed + i);
+    const g = render(frames[i], seed + i, scene);
     const t0 = performance.now();
     const r = tracker.update(g);
     times.push(performance.now() - t0);
@@ -279,6 +282,50 @@ const allErrs = [];
   console.log(`     leave: half-out frames ${partial.map(i => (res[i].lost ? 'lost' : fmt(res[i].err))).join(', ')}`);
   check(partialBad.length === 0, `leave: no drift while leaving (${partialBad.length} half-out frames off by > 6 px)`);
   allErrs.push(...stats('leave (fully inside)', res, inside));
+}
+
+
+// --- a textured object passes in front: the tracker must not ride away on it ---------------------------------------
+// A 90×120 block with its own texture crosses the square at 9 px/frame (the square moves 1.5 px/frame). Its motion is
+// perfectly consistent, so flow alone happily follows it; the appearance check must call those frames lost.
+{
+  const blockTex = valueNoise(47, -2, -2, 94, 124, [[8, 1], [3, 0.6]], 120, 45);
+  const path = i => ({ cx: 200 + 1.5 * i, cy: 180 });
+  const fr = seq(80, i => ({ ...path(i), blocks: [{ x: -100 + 9 * i, y: 120, w: 90, h: 120, tex: blockTex }] }));
+  const res = run('passer-by', fr, 1100);
+  const hijacked = range(1, 79).filter(i => !res[i].lost && res[i].err > 6);
+  console.log(`     passer-by: frames 24..50 -> ${range(24, 50).map(i => (res[i].lost ? 'lost' : fmt(res[i].err))).join(', ')}`);
+  check(hijacked.length === 0, `passer-by: never reported on the block (${hijacked.length} frames off by > 6 px while "tracking": ${hijacked.slice(0, 8).join(',')})`);
+  const back = range(44, 52).find(i => !res[i].lost && res[i].err <= 4);
+  check(back !== undefined, `passer-by: object found again at frame ${back} (block clear at 44, must be <= 52)`);
+  stats('passer-by (after it passed)', res, range(55, 79));
+}
+
+// --- a soft, low-detail object fully hidden for 50 frames over a smooth background ----------------------------------
+// Coarse NCC on smooth content matches almost anything; re-detection must not grab the background while it is hidden
+// and must find the object again when it comes back.
+for (const detail of [15, 25, 40]) {
+  const name = `hidden soft object (detail ${detail} px)`;
+  const scene = {
+    background: (() => {
+      const t = valueNoise(51, -2, -2, W + 4, H + 4, [[90, 1], [35, 0.5]], 110, 25);
+      const b = new Float32Array(W * H);
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) b[y * W + x] = t(x, y);
+      return b;
+    })(),
+    objTex: valueNoise(60 + detail, -SIDE / 2 - 2, -SIDE / 2 - 2, SIDE + 4, SIDE + 4, [[detail, 1]], 150, 40),
+  };
+  const path = i => ({ cx: 260 + 0.8 * i, cy: 170 + 0.3 * i });
+  const hidden = range(20, 69);
+  const block = { x: path(20).cx - 60, y: path(20).cy - 60, w: path(69).cx - path(20).cx + 120, h: path(69).cy - path(20).cy + 120, v: 100 };
+  const fr = seq(90, i => ({ ...path(i), blocks: hidden.includes(i) ? [block] : [] }));
+  const res = run(name, fr, 1200 + detail, 1, scene);
+  const wrong = range(1, 89).filter(i => !res[i].lost && res[i].err > 8);
+  const foundHidden = hidden.filter(i => !res[i].lost).length;
+  console.log(`     ${name}: found on ${foundHidden}/${hidden.length} hidden frames; frames 68..78 -> ${range(68, 78).map(i => (res[i].lost ? 'lost' : fmt(res[i].err))).join(', ')}`);
+  check(wrong.length === 0, `${name}: never reported somewhere else (${wrong.length} frames off by > 8 px: ${wrong.slice(0, 8).join(',')})`);
+  const back = range(70, 78).find(i => !res[i].lost && res[i].err <= 4);
+  check(back !== undefined, `${name}: found again at frame ${back} (back at 70, must be <= 78)`);
 }
 
 // --- pooled + timing --------------------------------------------------------------------------------------------------
