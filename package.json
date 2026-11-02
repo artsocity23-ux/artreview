@@ -1,0 +1,119 @@
+{
+  "name": "artframes",
+  "productName": "ArtFrames",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Light frame-by-frame animation: onion skin, round and flat brushes, drawing over a video or picture, GIF/MP4/PNG export.",
+  "author": {
+    "name": "artsocity23-ux",
+    "email": "263427273+artsocity23-ux@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/artsocity23-ux/artframes",
+  "repository": "github:artsocity23-ux/artframes",
+  "license": "MIT",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "selftest": "electron . --selftest selftest-out",
+    "icon": "node make-icon.js",
+    "dist": "electron-builder --publish never",
+    "bench": "electron . --bench bench-out",
+    "demo": "electron . --demo demo-out"
+  },
+  "dependencies": {
+    "gifenc": "^1.0.3",
+    "mediabunny": "^1.65.0",
+    "qrcode-generator": "^2.0.4"
+  },
+  "devDependencies": {
+    "electron": "^45.2.1",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "io.github.artsocity23ux.artframes",
+    "productName": "ArtFrames",
+    "copyright": "© 2026 artsocity23-ux · MIT",
+    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "selftest.js",
+      "bench.js",
+      "demo.js",
+      "index.html",
+      "app.css",
+      "src/**",
+      "donate.html",
+      "donate.js",
+      "donate.json",
+      "icon.png",
+      "!**/*.map",
+      "!**/*.d.ts",
+      "!node_modules/mediabunny/src/**",
+      "!node_modules/mediabunny/dist/modules/**",
+      "!node_modules/mediabunny/dist/bundles/*.cjs",
+      "!node_modules/mediabunny/dist/bundles/mediabunny.mjs",
+      "!node_modules/gifenc/dist/gifenc.js",
+      "!node_modules/gifenc/src/**"
+    ],
+    "fileAssociations": [
+      {
+        "ext": "artframes",
+        "name": "ArtFrames project",
+        "description": "Проєкт ArtFrames",
+        "role": "Editor"
+      }
+    ],
+    "publish": {
+      "provider": "github",
+      "releaseType": "release"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "icon.ico"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "runAfterFinish": true,
+      "shortcutName": "ArtFrames",
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
+      ],
+      "category": "public.app-category.graphics-design",
+      "icon": "build/icon.png",
+      "identity": "-",
+      "hardenedRuntime": false
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Graphics",
+      "icon": "build/icon.png",
+      "synopsis": "Frame-by-frame animation with onion skin and video reference",
+      "maintainer": "artsocity23-ux <263427273+artsocity23-ux@users.noreply.github.com>"
+    }
+  }
+}

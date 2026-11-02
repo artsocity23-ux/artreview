@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'">
+<title>Підтримати ArtFrames</title>
+<style>
+  :root {
+    --bg: #15171c;
+    --panel: #1c1f26;
+    --line: #2a2e37;
+    --hi: #282c35;
+    --text: #e7e9ee;
+    --dim: #8b91a0;
+    --accent: #ff5a4e;
+    --ok: #5fd38d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 "Segoe UI", system-ui, sans-serif; }
+  body { padding: 22px 22px 18px; user-select: none; }
+  h1 { margin: 0 0 6px; font-size: 18px; font-weight: 600; }
+  h1 span { color: var(--accent); }
+  .lead { margin: 0 0 18px; color: var(--dim); }
+  .coin {
+    display: grid;
+    grid-template-columns: 112px 1fr;
+    gap: 14px;
+    padding: 12px;
+    margin-bottom: 10px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }
+  .coin img { width: 112px; height: 112px; border-radius: 6px; background: #fff; }
+  .coin b { font-size: 14px; }
+  .net { color: var(--dim); margin-left: 6px; }
+  .addr {
+    margin: 6px 0 10px;
+    font: 12px/1.4 Consolas, "Cascadia Mono", ui-monospace, monospace;
+    word-break: break-all;
+    user-select: text;
+  }
+  button {
+    font: inherit;
+    color: var(--text);
+    background: var(--hi);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover { border-color: #3b414d; background: #2f3440; }
+  button.done { color: var(--ok); }
+  #links { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px; }
+  #links button { flex: 1 1 0; padding: 9px 12px; }
+  .thanks { margin: 14px 0 0; color: var(--dim); text-align: center; }
+</style>
+</head>
+<body>
+  <h1><span>♥</span> Підтримати ArtFrames</h1>
+  <p class="lead">ArtFrames безкоштовний і з відкритим кодом. Якщо тобі в ньому приємно малювати, можна пригостити автора кавою.</p>
+  <div id="crypto"></div>
+  <div id="links"></div>
+  <p class="thanks">Дякую!</p>
+  <script src="donate.js"></script>
+</body>
+</html>

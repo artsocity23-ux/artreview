@@ -1,0 +1,14 @@
+{
+  "crypto": [
+    { "name": "USDT", "network": "лише мережа Tron (TRC20)", "address": "TLzNJFQUgD7AqqdCggQdm7ogX4UPHrmZqV" },
+    { "name": "BTC", "network": "лише мережа Bitcoin", "address": "115jhb9iiWF99C5uaC6N27T4QVLmkmY2E8" },
+    { "name": "USDC", "network": "лише мережа BNB Smart Chain (BEP20)", "address": "0x87d6a63b18b351d34211cc4b04e28494c1eb963a" },
+    { "name": "SOL", "network": "лише мережа Solana", "address": "E2duNyxT8zmqEUwFuupoi8xJHBH4bt1axStYKrhS3M4x" },
+    { "name": "ADA", "network": "лише мережа Cardano", "address": "addr1vylp2e0g50p029ar76rvtavwq0wrazh63a60uazju482k2gz96gpm" }
+  ],
+  "links": [
+    { "name": "Ko-fi", "url": "" },
+    { "name": "Buy Me a Coffee", "url": "" },
+    { "name": "PayPal", "url": "" }
+  ]
+}

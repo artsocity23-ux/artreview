@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; img-src 'self' data: blob:; media-src 'self' file: blob:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:">
+<title>ArtFrames</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="bar">
+  <div class="group">
+    <button id="newBtn" title="Новий проєкт (Ctrl+N)"><svg viewBox="0 0 24 24"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5V8h4"/><path d="M12 11v6M9 14h6"/></svg></button>
+    <button id="openBtn" title="Відкрити проєкт (Ctrl+O)"><svg viewBox="0 0 24 24"><path d="M3.5 6.5v12h17V9H12l-2-2.5z"/></svg></button>
+    <button id="saveBtn" title="Зберегти проєкт (Ctrl+S, Ctrl+Shift+S — як)"><svg viewBox="0 0 24 24"><path d="M5 4h11l3 3v13H5z"/><path d="M8 4v5h7V4"/><path d="M8 20v-6h8v6"/></svg></button>
+  </div>
+  <div class="sep"></div>
+  <div class="group" id="tools">
+    <button data-tool="round" title="Кругла кисть (B)"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5.5" class="fill"/></svg><span>Кругла</span></button>
+    <button data-tool="flat" title="Широка кисть (F): товщина залежить від напрямку руху"><svg viewBox="0 0 24 24"><rect x="3.5" y="10.6" width="17" height="2.8" rx=".8" class="fill" transform="rotate(-45 12 12)"/></svg><span>Широка</span></button>
+    <button data-tool="eraser" title="Гумка (E) · кінчик-гумка пера теж стирає"><svg viewBox="0 0 24 24"><path d="M8.5 20h11"/><path d="M5.2 14.8l8.3-8.3a2 2 0 0 1 2.8 0l2.2 2.2a2 2 0 0 1 0 2.8L11.5 18.5H8.9z"/><path d="M9.5 10.5l5 5"/></svg><span>Гумка</span></button>
+  </div>
+  <div class="sep"></div>
+  <div class="group" id="target">
+    <button data-target="frames" title="Малювати кадри анімації (Tab — перемкнути)"><svg viewBox="0 0 24 24"><rect x="3.5" y="7.5" width="12" height="12" rx="1.5"/><path d="M7.5 4.5h11.5a1.5 1.5 0 0 1 1.5 1.5v11.5"/></svg><span>Кадри</span></button>
+    <button data-target="sketch" title="Малювати свій референс: шар під усіма кадрами, наприклад каліграфія, по якій потім анімуєш (Tab)"><svg viewBox="0 0 24 24"><path d="M3.5 15.5l8.5 4.5 8.5-4.5"/><path d="M15 3.5l3 3-7.5 7.5H7.5v-3z"/></svg><span>Референс</span></button>
+  </div>
+  <div class="size" title="Розмір кисті ([ і ])">
+    <input type="range" id="sizeRange" min="0" max="1000" step="1">
+    <input type="number" id="sizeNum" min="1" max="400" step="1">
+  </div>
+  <div class="sep"></div>
+  <div class="group" id="colors"></div>
+  <label class="swatch-pick" title="Свій колір · Alt+клік по малюнку — піпетка"><input type="color" id="colorPick"><i></i></label>
+  <div class="sep"></div>
+  <div class="group">
+    <button id="undoBtn" title="Скасувати (Ctrl+Z)"><svg viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg></button>
+    <button id="redoBtn" title="Повторити (Ctrl+Shift+Z / Ctrl+Y)"><svg viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></svg></button>
+  </div>
+  <div class="sep"></div>
+  <div class="group">
+    <button id="onionBtn" title="Калька: примари сусідніх кадрів (O)"><svg viewBox="0 0 24 24"><circle cx="9" cy="12" r="5.5" class="ghost-a"/><circle cx="15" cy="12" r="5.5" class="ghost-b"/></svg></button>
+    <button id="refBtn" title="Показати / сховати референс (R)"><svg viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M3.5 16l5-5 4 4 3-3 5 5"/><circle cx="15.5" cy="9" r="1.4"/></svg></button>
+    <button id="mirrorBtn" title="Віддзеркалити полотно, щоб перевірити малюнок (M)"><svg viewBox="0 0 24 24"><path d="M12 3v18"/><path d="M9 7L4 17h5zM15 7l5 10h-5z"/></svg></button>
+  </div>
+  <div class="spacer"></div>
+  <button id="zoomBtn" class="ghost" title="Вмістити в екран (0) · колесо — масштаб">100%</button>
+  <button id="helpBtn" class="ghost" title="Гарячі клавіші (F1)">?</button>
+  <button id="donateBtn" class="ghost heart" title="Підтримати автора" hidden>♥</button>
+  <button id="exportBtn" class="primary" title="GIF, MP4, WebM або PNG-кадри">Експорт<kbd>Ctrl+E</kbd></button>
+</header>
+
+<main>
+  <section id="stage">
+    <div id="sheet"></div>
+    <canvas id="gl"></canvas>
+    <div id="cursor"><i></i></div>
+    <div id="hud"></div>
+    <div id="modeBadge">Малюєш свій референс: він лежить під усіма кадрами<kbd>Tab</kbd>назад до кадрів</div>
+    <div id="dropHint">Відпусти файл: картинка чи відео стане референсом, .artframes відкриється як проєкт</div>
+  </section>
+
+  <aside id="side">
+    <section>
+      <h2>Кисть</h2>
+      <label class="row toggle"><input type="checkbox" id="pressure"><span>Тиск пера змінює товщину</span></label>
+      <label class="row"><span>Згладжування</span><input type="range" id="smoothing" min="0" max="90" step="5"><output id="smoothingOut"></output></label>
+      <label class="row" id="angleRow"><span>Кут широкої</span><input type="range" id="angle" min="0" max="180" step="5"><output id="angleOut"></output></label>
+    </section>
+
+    <section>
+      <h2>Калька <kbd>O</kbd></h2>
+      <label class="row toggle"><input type="checkbox" id="onionOn"><span>Показувати сусідні кадри</span></label>
+      <div class="row"><span>Попередні</span>
+        <div class="stepper" data-key="prev"><button>−</button><b></b><button>+</button></div>
+        <label class="dot" title="Колір попередніх"><input type="color" id="prevColor"><i></i></label>
+      </div>
+      <div class="row"><span>Наступні</span>
+        <div class="stepper" data-key="next"><button>−</button><b></b><button>+</button></div>
+        <label class="dot" title="Колір наступних"><input type="color" id="nextColor"><i></i></label>
+      </div>
+      <label class="row"><span>Прозорість</span><input type="range" id="onionOpacity" min="5" max="100" step="5"><output id="onionOpacityOut"></output></label>
+    </section>
+
+    <section>
+      <h2>Референс <kbd>R</kbd></h2>
+      <div id="refEmpty">
+        <p class="hint">Картинка або відео під кадрами: обводити рух чи домальовувати приколи поверх відео. Можна просто перетягнути файл у вікно.</p>
+        <button class="wide" id="refLoad" title="Завантажити картинку чи відео (Ctrl+I)">Картинка чи відео…<kbd>Ctrl+I</kbd></button>
+      </div>
+      <div id="refInfo" hidden>
+        <div class="refname"><b id="refName"></b><button id="refRemove" class="x" title="Прибрати референс">×</button></div>
+        <p class="hint" id="refMeta"></p>
+        <label class="row toggle"><input type="checkbox" id="refVisible"><span>Показувати</span></label>
+        <label class="row"><span>Прозорість</span><input type="range" id="refOpacity" min="5" max="100" step="5"><output id="refOpacityOut"></output></label>
+        <div id="refVideo">
+          <label class="row toggle"><input type="checkbox" id="refSound"><span>Звук під час відтворення</span></label>
+          <label class="row"><span>Почати з кадру відео</span><input type="number" id="refOffset" min="0" step="1"></label>
+          <button class="wide" id="refFill" title="Додати порожні кадри, поки анімація не стане довжиною з відео">Розтягнути таймлайн на все відео</button>
+        </div>
+        <button class="wide ghostbtn" id="refReplace">Замінити…</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Свій референс <kbd>Tab</kbd></h2>
+      <p class="hint" id="sketchHint">Намалюй каліграфію, траєкторію чи макет на окремому шарі під усіма кадрами й анімуй поверх. Лягає над картинкою чи відео.</p>
+      <button class="wide" id="sketchMode"></button>
+      <label class="row toggle"><input type="checkbox" id="sketchVisible"><span>Показувати <small class="dimkey">Shift+R</small></span></label>
+      <label class="row"><span>Прозорість</span><input type="range" id="sketchOpacity" min="5" max="100" step="5"><output id="sketchOpacityOut"></output></label>
+      <div class="pair">
+        <button class="wide" id="frameToSketch" title="Додати малюнок поточного кадру у свій референс">Кадр → реф.</button>
+        <button class="wide" id="sketchToFrame" title="Додати свій референс у поточний кадр (під його малюнок)">Реф. → кадр</button>
+      </div>
+      <button class="wide ghostbtn" id="sketchClear">Очистити свій референс</button>
+    </section>
+
+    <section>
+      <h2>Проєкт</h2>
+      <p class="hint" id="docMeta"></p>
+      <label class="row"><span>Папір</span><label class="dot" title="Колір паперу"><input type="color" id="paperColor"><i></i></label></label>
+    </section>
+  </aside>
+</main>
+
+<footer id="timeline">
+  <div id="transport">
+    <div class="group">
+      <button id="firstBtn" title="Перший кадр (Home)"><svg viewBox="0 0 24 24"><path d="M17 6l-6 6 6 6"/><path d="M7 6v12"/></svg></button>
+      <button id="prevBtn" title="Попередній кадр (← або ,)"><svg viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg></button>
+      <button id="playBtn" class="play" title="Грати / пауза (Пробіл)"><svg viewBox="0 0 24 24"><path class="fill" d="M8 5.5v13l10.5-6.5z"/></svg></button>
+      <button id="nextBtn" title="Наступний кадр (→ або .)"><svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg></button>
+      <button id="lastBtn" title="Останній кадр (End)"><svg viewBox="0 0 24 24"><path d="M7 6l6 6-6 6"/><path d="M17 6v12"/></svg></button>
+      <button id="loopBtn" title="Повтор по колу"><svg viewBox="0 0 24 24"><path d="M17 3.5l3 3-3 3"/><path d="M20 6.5H8.5a4.5 4.5 0 0 0-4.5 4.5v.5"/><path d="M7 20.5l-3-3 3-3"/><path d="M4 17.5h11.5a4.5 4.5 0 0 0 4.5-4.5v-.5"/></svg></button>
+    </div>
+    <div id="frameInfo"></div>
+    <label class="fps" title="Кадрів на секунду"><input type="number" id="fps" min="1" max="120" step="1"><span>к/с</span></label>
+    <div class="seg" id="stepSeg" title="Скільки триває новий кадр: на одиницях, двійках чи трійках">
+      <span>Новий кадр</span><button data-step="1">×1</button><button data-step="2">×2</button><button data-step="3">×3</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="group">
+      <button id="addBtn" class="labeled" title="Новий порожній кадр після поточного (N)"><svg viewBox="0 0 24 24"><rect x="4.5" y="4.5" width="15" height="15" rx="2"/><path d="M12 8.5v7M8.5 12h7"/></svg>Кадр</button>
+      <button id="dupBtn" class="labeled" title="Дублювати кадр (D)"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8"/></svg>Копія</button>
+      <button id="delBtn" title="Видалити кадр (Shift+Delete) · Delete — лише очистити"><svg viewBox="0 0 24 24"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l1 12.5h9l1-12.5"/></svg></button>
+    </div>
+    <div class="sep"></div>
+    <div class="hold" title="Утримання: на скільки кадрів фільму затримується цей малюнок (− і =)">
+      <span>Утримання</span><button id="holdMinus">−</button><b id="holdVal">×1</b><button id="holdPlus">+</button>
+    </div>
+  </div>
+  <div id="strip"></div>
+</footer>
+
+<div id="status">
+  <span><kbd>B</kbd><kbd>F</kbd><kbd>E</kbd>кисть, гумка</span>
+  <span><kbd>[</kbd><kbd>]</kbd>розмір</span>
+  <span><kbd>N</kbd>новий кадр</span>
+  <span><kbd>←</kbd><kbd>→</kbd>кадри</span>
+  <span><kbd>Пробіл</kbd>грати</span>
+  <span><kbd>O</kbd>калька</span>
+  <span><kbd>R</kbd>референс</span>
+  <span><kbd>Tab</kbd>малювати референс</span>
+  <span><kbd>−</kbd><kbd>=</kbd>утримання</span>
+  <span><kbd>Alt</kbd>+клік піпетка</span>
+  <span><kbd>F1</kbd>усі клавіші</span>
+</div>
+
+<div id="modal" hidden></div>
+<div id="toast"></div>
+<audio id="audio" preload="auto"></audio>
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
